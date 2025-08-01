@@ -1,2 +1,3 @@
 # The-Reckoning-
  Game Title: The Reckoning! Engine: RAYLIB 3D Genre: Action RPG / Hack-and-Slash / Dark Fantasy Mode: Single-player (Multiplayer optional in roadmap) Platform: PC (with potential for console support)
+“The Reckoning!” is a brutal, high-stakes 3D action RPG forged in the heart of chaos. Set in a sprawling, war-ravaged world steeped in ancient prophecy and dark magic, you take on the role of The Bound One — a fallen knight bound by cursed chains, resurrected from the ashes to fulfill the Reckoning: an ancient ritual of vengeance that will either cleanse the realm or doom it forever.
