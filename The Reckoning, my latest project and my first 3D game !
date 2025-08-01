@@ -1,0 +1,94 @@
+// The Reckoning! — Main Game Skeleton (RAYLIB 3D)
+// Compile with: gcc main.c -o reckoning -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+
+#include "raylib.h"
+#include "raymath.h"
+
+// === Game Constants ===
+#define SCREEN_WIDTH 1280
+#define SCREEN_HEIGHT 720
+#define PLAYER_SPEED 5.0f
+
+// === Player Structure ===
+typedef struct Player {
+    Vector3 position;
+    Vector3 velocity;
+    float radius;
+    float height;
+} Player;
+
+// === Camera ===
+Camera3D camera = { 0 };
+
+// === Initialize Player ===
+Player InitPlayer() {
+    Player p = { 0 };
+    p.position = (Vector3){ 0.0f, 1.0f, 0.0f };
+    p.velocity = (Vector3){ 0 };
+    p.radius = 0.4f;
+    p.height = 1.8f;
+    return p;
+}
+
+// === Update Player Movement ===
+void UpdatePlayer(Player *player, float delta) {
+    Vector3 move = { 0 };
+
+    if (IsKeyDown(KEY_W)) move.z -= 1;
+    if (IsKeyDown(KEY_S)) move.z += 1;
+    if (IsKeyDown(KEY_A)) move.x -= 1;
+    if (IsKeyDown(KEY_D)) move.x += 1;
+
+    move = Vector3Normalize(move);
+    move = Vector3Scale(move, PLAYER_SPEED * delta);
+    player->position = Vector3Add(player->position, move);
+
+    // Camera follows player
+    camera.target = player->position;
+    camera.position = (Vector3){ player->position.x, player->position.y + 2.0f, player->position.z + 6.0f };
+}
+
+int main() {
+    // Init Window and RAYLIB
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "The Reckoning!");
+    SetTargetFPS(60);
+
+    // Init Camera
+    camera.position = (Vector3){ 0.0f, 2.0f, 6.0f };
+    camera.target = (Vector3){ 0.0f, 1.0f, 0.0f };
+    camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    // Init Player
+    Player player = InitPlayer();
+
+    // Main Game Loop
+    while (!WindowShouldClose()) {
+        float delta = GetFrameTime();
+
+        // Update
+        UpdatePlayer(&player, delta);
+
+        // Draw
+        BeginDrawing();
+        ClearBackground(DARKGRAY);
+
+        BeginMode3D(camera);
+
+            DrawGrid(20, 1.0f);
+            DrawCube(player.position, 1.0f, player.height, 1.0f, RED);
+            DrawCubeWires(player.position, 1.0f, player.height, 1.0f, BLACK);
+
+        EndMode3D();
+
+        DrawText("The Reckoning! — Pre-Alpha Build", 10, 10, 20, RAYWHITE);
+        DrawFPS(SCREEN_WIDTH - 90, 10);
+
+        EndDrawing();
+    }
+
+    // Cleanup
+    CloseWindow();
+    return 0;
+}
