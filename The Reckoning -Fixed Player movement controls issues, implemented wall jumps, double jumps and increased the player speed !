@@ -1,0 +1,207 @@
+#include "raylib.h"
+#include "raymath.h"
+#include <math.h>
+
+#define SCREEN_WIDTH 1280
+#define SCREEN_HEIGHT 720
+
+#define PLAYER_SPEED 10.0f      // Movement speed boosted!
+#define GRAVITY 9.8f
+#define JUMP_FORCE 6.5f
+#define MOUSE_SENSITIVITY 0.003f
+#define MAX_JUMPS 2
+#define WALL_JUMP_DISTANCE 0.6f
+
+typedef struct Player {
+    Vector3 position;
+    Vector3 velocity;
+    float radius;
+    float height;
+    bool onGround;
+    int jumpCount;
+    bool canWallJump;
+} Player;
+
+typedef struct ThirdPersonCamera {
+    Camera3D camera;
+    float distance;
+    float pitch;
+    float yaw;
+    Vector2 lastMousePos;
+    bool firstMouse;
+} ThirdPersonCamera;
+
+float GetTerrainHeight(float x, float z) {
+    return sinf(x * 0.3f) * 2.0f + cosf(z * 0.3f) * 2.0f;
+}
+
+Player InitPlayer(void) {
+    Player p = { 0 };
+    p.position = (Vector3){ 0.0f, 2.0f, 0.0f };
+    p.velocity = (Vector3){ 0 };
+    p.radius = 0.4f;
+    p.height = 1.8f;
+    p.onGround = false;
+    p.jumpCount = 0;
+    p.canWallJump = false;
+    return p;
+}
+
+void UpdatePlayer(Player *player, float delta, Camera3D camera) {
+    Vector3 moveDirection = { 0 };
+
+    Vector3 camForward = Vector3Subtract(camera.target, camera.position);
+    camForward.y = 0;
+    camForward = Vector3Normalize(camForward);
+
+    Vector3 camRight = Vector3Normalize(Vector3CrossProduct(camForward, (Vector3){0, 1, 0}));
+
+    if (IsKeyDown(KEY_W)) moveDirection = Vector3Add(moveDirection, camForward);
+    if (IsKeyDown(KEY_S)) moveDirection = Vector3Subtract(moveDirection, camForward);
+    if (IsKeyDown(KEY_A)) moveDirection = Vector3Subtract(moveDirection, camRight);
+    if (IsKeyDown(KEY_D)) moveDirection = Vector3Add(moveDirection, camRight);
+
+    if (moveDirection.x != 0 || moveDirection.z != 0) {
+        moveDirection = Vector3Normalize(moveDirection);
+        moveDirection = Vector3Scale(moveDirection, PLAYER_SPEED);  // No delta!
+    }
+
+    player->velocity.x = moveDirection.x;
+    player->velocity.z = moveDirection.z;
+
+    // Gravity
+    player->velocity.y -= GRAVITY * delta;
+
+    // Predict Y position
+    Vector3 predictedPos = Vector3Add(player->position, (Vector3){0, player->velocity.y * delta, 0});
+    float terrainHeight = GetTerrainHeight(predictedPos.x, predictedPos.z);
+
+    player->onGround = false;
+    if (predictedPos.y <= terrainHeight + player->height / 2) {
+        predictedPos.y = terrainHeight + player->height / 2;
+        player->velocity.y = 0;
+        player->onGround = true;
+        player->jumpCount = 0;
+    }
+
+    // Wall detection
+    float offset = WALL_JUMP_DISTANCE;
+    float h1 = GetTerrainHeight(player->position.x + offset, player->position.z);
+    float h2 = GetTerrainHeight(player->position.x - offset, player->position.z);
+    float h3 = GetTerrainHeight(player->position.x, player->position.z + offset);
+    float h4 = GetTerrainHeight(player->position.x, player->position.z - offset);
+
+    player->canWallJump = (!player->onGround) &&
+        (fabsf(h1 - player->position.y) < 2.0f ||
+         fabsf(h2 - player->position.y) < 2.0f ||
+         fabsf(h3 - player->position.y) < 2.0f ||
+         fabsf(h4 - player->position.y) < 2.0f);
+
+    // Jumping
+    if (IsKeyPressed(KEY_SPACE)) {
+        if (player->onGround || player->jumpCount < MAX_JUMPS) {
+            player->velocity.y = JUMP_FORCE;
+            player->jumpCount++;
+        } else if (player->canWallJump) {
+            player->velocity.y = JUMP_FORCE;
+            player->jumpCount = 1;
+        }
+    }
+
+    player->position = Vector3Add(player->position, Vector3Scale(player->velocity, delta));
+}
+
+ThirdPersonCamera InitCamera(Vector3 position) {
+    ThirdPersonCamera cam = { 0 };
+    cam.camera.position = position;
+    cam.camera.target = (Vector3){ 0, 0, 0 };
+    cam.camera.up = (Vector3){ 0, 1, 0 };
+    cam.camera.fovy = 45.0f;
+    cam.camera.projection = CAMERA_PERSPECTIVE;
+
+    cam.distance = 6.0f;
+    cam.pitch = 0.3f;
+    cam.yaw = 3.14f;
+    cam.firstMouse = true;
+
+    return cam;
+}
+
+void UpdateCamera(ThirdPersonCamera *cam, Player *player) {
+    Vector2 mousePos = GetMousePosition();
+
+    if (cam->firstMouse) {
+        cam->lastMousePos = mousePos;
+        cam->firstMouse = false;
+    }
+
+    Vector2 delta = { mousePos.x - cam->lastMousePos.x, mousePos.y - cam->lastMousePos.y };
+    cam->lastMousePos = mousePos;
+
+    cam->yaw -= delta.x * MOUSE_SENSITIVITY;
+    cam->pitch -= delta.y * MOUSE_SENSITIVITY;
+
+    if (cam->pitch > 1.5f) cam->pitch = 1.5f;
+    if (cam->pitch < -1.5f) cam->pitch = -1.5f;
+
+    float x = cam->distance * cosf(cam->pitch) * cosf(cam->yaw);
+    float y = cam->distance * sinf(cam->pitch);
+    float z = cam->distance * cosf(cam->pitch) * sinf(cam->yaw);
+
+    cam->camera.position = (Vector3){
+        player->position.x + x,
+        player->position.y + y + 1.0f,
+        player->position.z + z
+    };
+
+    cam->camera.target = (Vector3){
+        player->position.x,
+        player->position.y + 1.0f,
+        player->position.z
+    };
+}
+
+int main(void) {
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "The Reckoning! - Alpha Build");
+    SetTargetFPS(60);
+    DisableCursor();
+
+    Player player = InitPlayer();
+    ThirdPersonCamera camera = InitCamera((Vector3){ 0, 2, 6 });
+
+    while (!WindowShouldClose()) {
+        float delta = GetFrameTime();
+
+        UpdatePlayer(&player, delta, camera.camera);
+        UpdateCamera(&camera, &player);
+
+        BeginDrawing();
+        ClearBackground(DARKGRAY);
+
+        BeginMode3D(camera.camera);
+
+        // Terrain
+        for (float x = -20; x <= 20; x += 1.0f) {
+            for (float z = -20; z <= 20; z += 1.0f) {
+                float h = GetTerrainHeight(x, z);
+                DrawCube((Vector3){x, h - 0.5f, z}, 1.0f, 1.0f, 1.0f, DARKGREEN);
+                DrawCubeWires((Vector3){x, h - 0.5f, z}, 1.0f, 1.0f, 1.0f, BLACK);
+            }
+        }
+
+        // Player
+        DrawCube(player.position, player.radius * 2, player.height, player.radius * 2, RED);
+        DrawCubeWires(player.position, player.radius * 2, player.height, player.radius * 2, BLACK);
+
+        EndMode3D();
+
+        DrawText("The Reckoning! - Alpha Build", 10, 10, 20, RAYWHITE);
+        DrawText(TextFormat("Jump Count: %d", player.jumpCount), 10, 40, 20, LIGHTGRAY);
+        DrawFPS(SCREEN_WIDTH - 90, 10);
+
+        EndDrawing();
+    }
+
+    CloseWindow();
+    return 0;
+}
