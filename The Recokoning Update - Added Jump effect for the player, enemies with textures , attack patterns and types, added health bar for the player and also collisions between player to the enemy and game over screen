@@ -1,0 +1,331 @@
+#include "raylib.h"
+#include <math.h>
+#include <stdbool.h>
+
+#define MAX_ENEMIES 5
+
+typedef enum {ROAMING, CHASING, ATTACKING, ATTACK_COOLDOWN} EnemyState;
+
+typedef struct Enemy {
+    Vector3 position;
+    Vector3 direction;
+    float speed;
+    EnemyState state;
+    float attackTimer;
+    float attackCooldown;
+    bool damageApplied;
+} Enemy;
+
+typedef struct Player {
+    Vector3 position;
+    Vector3 velocity;
+    int health;
+    bool onGround;
+    int jumpsLeft;
+    bool wallJumpAllowed;
+    float staggerTimer;
+    bool isDead;    // <-- added
+} Player;
+
+// Globals
+Camera3D camera = {0};
+Player player = {0};
+Enemy enemies[MAX_ENEMIES];
+
+Sound jumpSound = {0};
+Sound hitSound = {0};
+Sound attackSound = {0};
+
+float gravity = 20.0f;
+float playerSpeed = 8.0f;
+float jumpForce = 9.0f;
+
+float enemySpeed = 3.0f;
+float attackRange = 2.0f;
+float attackDuration = 0.4f;
+float attackDamageTime = 0.2f; // When damage applies during attack animation
+float staggerDuration = 0.3f;
+
+void InitPlayer() {
+    player.position = (Vector3){0, 1, 0};
+    player.velocity = (Vector3){0, 0, 0};
+    player.health = 100;
+    player.onGround = false;
+    player.jumpsLeft = 2;
+    player.wallJumpAllowed = false;
+    player.staggerTimer = 0.0f;
+    player.isDead = false;   // reset dead state
+}
+
+void InitEnemies() {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        enemies[i].position = (Vector3){-10.0f + i*5.0f, 1, -10.0f + i*3.0f};
+        enemies[i].direction = (Vector3){1, 0, 0};
+        enemies[i].speed = enemySpeed;
+        enemies[i].state = ROAMING;
+        enemies[i].attackTimer = 0.0f;
+        enemies[i].attackCooldown = 0.0f;
+        enemies[i].damageApplied = false;
+    }
+}
+
+bool CheckCollisionBoxes(Vector3 pos1, float size1, Vector3 pos2, float size2) {
+    return (fabsf(pos1.x - pos2.x) < size1 + size2) &&
+           (fabsf(pos1.y - pos2.y) < size1 + size2) &&
+           (fabsf(pos1.z - pos2.z) < size1 + size2);
+}
+
+void UpdatePlayer(float delta) {
+    if (player.isDead) return;  // no input or movement if dead
+
+    Vector3 forward = {0,0,1};
+    Vector3 right = {1,0,0};
+
+    // Handle stagger timer
+    if (player.staggerTimer > 0) {
+        player.staggerTimer -= delta;
+    }
+
+    // Movement input only if not staggered
+    Vector3 moveInput = {0, 0, 0};
+    if (player.staggerTimer <= 0) {
+        if (IsKeyDown(KEY_W)) moveInput.z -= 1;
+        if (IsKeyDown(KEY_S)) moveInput.z += 1;
+        if (IsKeyDown(KEY_A)) moveInput.x -= 1;
+        if (IsKeyDown(KEY_D)) moveInput.x += 1;
+    }
+
+    // Normalize movement input
+    float len = sqrtf(moveInput.x*moveInput.x + moveInput.z*moveInput.z);
+    if (len > 0) {
+        moveInput.x /= len;
+        moveInput.z /= len;
+    }
+
+    // Apply movement speed (halved if staggered)
+    float speedMod = (player.staggerTimer > 0) ? 0.4f : 1.0f;
+    player.position.x += moveInput.x * playerSpeed * speedMod * delta;
+    player.position.z += moveInput.z * playerSpeed * speedMod * delta;
+
+    // Gravity and vertical movement
+    player.velocity.y -= gravity * delta;
+    player.position.y += player.velocity.y * delta;
+
+    // Simple ground check
+    if (player.position.y <= 1.0f) {
+        player.position.y = 1.0f;
+        player.velocity.y = 0;
+        player.onGround = true;
+        player.jumpsLeft = 2;
+        player.wallJumpAllowed = false;
+    } else {
+        player.onGround = false;
+    }
+
+    // Jumping (if not staggered)
+    if (player.staggerTimer <= 0) {
+        if (IsKeyPressed(KEY_SPACE)) {
+            if (player.jumpsLeft > 0) {
+                player.velocity.y = jumpForce;
+                player.jumpsLeft--;
+                PlaySound(jumpSound);
+            }
+        }
+    }
+}
+
+void UpdateEnemy(Enemy* enemy, float delta) {
+    Vector3 toPlayer = {
+        player.position.x - enemy->position.x,
+        0,
+        player.position.z - enemy->position.z
+    };
+    float distToPlayer = sqrtf(toPlayer.x*toPlayer.x + toPlayer.z*toPlayer.z);
+
+    // Normalize toPlayer direction
+    if (distToPlayer > 0) {
+        toPlayer.x /= distToPlayer;
+        toPlayer.z /= distToPlayer;
+    }
+
+    switch(enemy->state) {
+        case ROAMING:
+            enemy->position.x += enemy->direction.x * enemy->speed * delta;
+            enemy->position.z += enemy->direction.z * enemy->speed * delta;
+
+            if (fabsf(enemy->position.x) > 15 || fabsf(enemy->position.z) > 15) {
+                enemy->direction.x = -enemy->direction.x;
+                enemy->direction.z = -enemy->direction.z;
+            }
+
+            if (distToPlayer < 10.0f) {
+                enemy->state = CHASING;
+            }
+            break;
+
+        case CHASING:
+            enemy->position.x += toPlayer.x * enemy->speed * delta;
+            enemy->position.z += toPlayer.z * enemy->speed * delta;
+
+            if (distToPlayer < attackRange) {
+                enemy->state = ATTACKING;
+                enemy->attackTimer = 0.0f;
+                enemy->damageApplied = false;
+            }
+            else if (distToPlayer > 15.0f) {
+                enemy->state = ROAMING;
+                enemy->direction = (Vector3){(float)(rand()%3-1), 0, (float)(rand()%3-1)};
+                if (enemy->direction.x == 0 && enemy->direction.z == 0) enemy->direction.x = 1;
+            }
+            break;
+
+        case ATTACKING:
+            enemy->attackTimer += delta;
+
+            if (enemy->attackTimer >= attackDamageTime && !enemy->damageApplied) {
+                if (distToPlayer < attackRange + 0.5f && !player.isDead) {
+                    player.health -= 10;
+                    if (player.health <= 0) {
+                        player.health = 0;
+                        player.isDead = true;
+                        player.staggerTimer = 0.0f;
+                    } else {
+                        player.staggerTimer = staggerDuration;
+                    }
+                    PlaySound(hitSound);
+                }
+                enemy->damageApplied = true;
+            }
+
+            if (enemy->attackTimer >= attackDuration) {
+                enemy->state = ATTACK_COOLDOWN;
+                enemy->attackCooldown = 1.0f;
+            }
+            break;
+
+        case ATTACK_COOLDOWN:
+            enemy->attackCooldown -= delta;
+            if (enemy->attackCooldown <= 0) {
+                enemy->state = CHASING;
+            }
+            break;
+    }
+}
+
+void DrawEnemy(Enemy* enemy) {
+    Color color = RED;
+    float scale = 1.0f;
+
+    if (enemy->state == ATTACKING) {
+        float progress = enemy->attackTimer / attackDuration;
+        if (progress < 0.5f)
+            scale = 1.0f + progress * 0.6f;
+        else
+            scale = 1.3f - (progress - 0.5f) * 0.6f;
+
+        color = (Color){255, (unsigned char)(255 * (1.0f - progress)), (unsigned char)(255 * (1.0f - progress)), 255};
+    } else if (enemy->state == ATTACK_COOLDOWN) {
+        color = ORANGE;
+    } else if (enemy->state == CHASING) {
+        color = MAROON;
+    } else {
+        color = DARKGRAY;
+    }
+
+    DrawCube(enemy->position, 1.0f * scale, 2.0f * scale, 1.0f * scale, color);
+    DrawCubeWires(enemy->position, 1.0f * scale, 2.0f * scale, 1.0f * scale, BLACK);
+}
+
+void DrawHealthBar(int health, int maxHealth, int posX, int posY) {
+    int width = 200;
+    int height = 25;
+    float ratio = (float)health / maxHealth;
+    if (ratio < 0) ratio = 0;
+
+    DrawRectangle(posX, posY, width, height, DARKGRAY);
+    DrawRectangle(posX, posY, (int)(width * ratio), height, RED);
+    DrawRectangleLines(posX, posY, width, height, BLACK);
+
+    DrawText(TextFormat("Health: %d / %d", health, maxHealth), posX + 5, posY + 3, 20, WHITE);
+}
+
+int main(void)
+{
+    const int screenWidth = 1280;
+    const int screenHeight = 720;
+
+    InitWindow(screenWidth, screenHeight, "The Reckoning! - Dead State & Health Clamp");
+
+    InitPlayer();
+    InitEnemies();
+
+    InitAudioDevice();
+    jumpSound = LoadSound("resources/sounds/jump.ogg");
+    hitSound = LoadSound("resources/sounds/hit.ogg");
+    attackSound = LoadSound("resources/sounds/attack.ogg");
+
+    // Camera setup
+    camera.position = (Vector3){player.position.x + 5.0f, 5.0f, player.position.z + 5.0f};
+    camera.target = player.position;
+    camera.up = (Vector3){0.0f, 1.0f, 0.0f};
+    camera.fovy = 45.0f;
+    // camera.type = CAMERA_PERSPECTIVE; // Remove if using older Raylib
+
+    SetTargetFPS(60);
+
+    while (!WindowShouldClose())
+    {
+        float delta = GetFrameTime();
+
+        UpdatePlayer(delta);
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            UpdateEnemy(&enemies[i], delta);
+        }
+
+        Vector3 camOffset = {5.0f, 5.0f, 5.0f};
+        camera.position = (Vector3){
+            player.position.x + camOffset.x,
+            player.position.y + camOffset.y,
+            player.position.z + camOffset.z
+        };
+        camera.target = player.position;
+
+        if (player.isDead && IsKeyPressed(KEY_R)) {
+            InitPlayer();
+        }
+
+        BeginDrawing();
+
+        ClearBackground(RAYWHITE);
+
+        BeginMode3D(camera);
+
+        DrawCube(player.position, 1.0f, 2.0f, 1.0f, BLUE);
+        DrawCubeWires(player.position, 1.0f, 2.0f, 1.0f, DARKBLUE);
+
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            DrawEnemy(&enemies[i]);
+        }
+
+        DrawGrid(20, 1.0f);
+
+        EndMode3D();
+
+        DrawHealthBar(player.health, 100, 20, 20);
+
+        if (player.isDead) {
+            DrawText("You are DEAD! Press R to Restart", screenWidth/2 - 150, screenHeight/2, 20, RED);
+        }
+
+        EndDrawing();
+    }
+
+    UnloadSound(jumpSound);
+    UnloadSound(hitSound);
+    UnloadSound(attackSound);
+
+    CloseAudioDevice();
+    CloseWindow();
+
+    return 0;
+}
