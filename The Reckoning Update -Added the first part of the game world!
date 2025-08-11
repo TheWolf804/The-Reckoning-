@@ -1,0 +1,368 @@
+#include "raylib.h"
+#include <cmath>
+#include <vector>
+
+// Constants
+const float PLAYER_SPEED = 5.0f;
+const float PLAYER_JUMP_FORCE = 8.0f;
+const float GRAVITY = 20.0f;
+const int MAX_ENEMIES = 5;
+const int MAX_FIREBALLS = 10;
+
+struct Entity {
+    Vector3 position;
+    Vector3 velocity;
+    bool onGround;
+    int health;
+    bool blocking;
+    bool alive;
+};
+
+struct Enemy {
+    Vector3 position;
+    Vector3 velocity;
+    int health;
+    bool alive;
+    Vector3 patrolStart;
+    Vector3 patrolEnd;
+    bool movingToEnd;
+};
+
+struct Fireball {
+    Vector3 position;
+    Vector3 velocity;
+    bool active;
+};
+
+// Globals
+Camera3D camera = {0};
+Entity player = {0};
+Enemy enemies[MAX_ENEMIES] = {0};
+Fireball fireballs[MAX_FIREBALLS] = {0};
+
+Mesh terrainMesh;
+Model terrainModel;
+
+Sound jumpSound;
+Sound fireballSound;
+Sound hitSound;
+Sound blockSound;
+
+bool canDoubleJump = true;
+bool canWallJump = false;
+
+float deltaTime = 0.0f;
+
+// Function prototypes
+void InitTerrain();
+void UpdatePlayer(float dt);
+void UpdateEnemies(float dt);
+void UpdateFireballs(float dt);
+void DrawHealthBar(Vector3 position, int currentHealth, int maxHealth);
+void SpawnFireball();
+void PlayerAttackLight();
+void PlayerAttackHeavy();
+void PlayerBlock();
+
+int main() {
+    // Initialization
+    InitWindow(1280, 720, "The Reckoning! - Raylib 3D RPG");
+    SetTargetFPS(60);
+
+    // Camera setup
+    camera.position = (Vector3){0.0f, 5.0f, 10.0f};
+    camera.target = (Vector3){0.0f, 1.0f, 0.0f};
+    camera.up = (Vector3){0.0f, 1.0f, 0.0f};
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    // Player init
+    player.position = (Vector3){0.0f, 1.0f, 0.0f};
+    player.velocity = (Vector3){0.0f, 0.0f, 0.0f};
+    player.onGround = false;
+    player.health = 100;
+    player.blocking = false;
+    player.alive = true;
+
+    // Enemy init
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        enemies[i].position = (Vector3){(float)(-10 + i * 5), 1.0f, (float)(-5 + i * 3)};
+        enemies[i].velocity = (Vector3){0.0f, 0.0f, 0.0f};
+        enemies[i].health = 50;
+        enemies[i].alive = true;
+        enemies[i].patrolStart = enemies[i].position;
+        enemies[i].patrolEnd = (Vector3){enemies[i].position.x + 5.0f, enemies[i].position.y, enemies[i].position.z};
+        enemies[i].movingToEnd = true;
+    }
+
+    // Fireballs init
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        fireballs[i].active = false;
+    }
+
+    // Load sounds (use your .ogg paths here)
+    InitAudioDevice();
+    jumpSound = LoadSound("sounds/jump.ogg");
+    fireballSound = LoadSound("sounds/fireball.ogg");
+    hitSound = LoadSound("sounds/hit.ogg");
+    blockSound = LoadSound("sounds/block.ogg");
+
+    // Terrain init
+    InitTerrain();
+
+    // Main loop
+    while (!WindowShouldClose()) {
+        deltaTime = GetFrameTime();
+
+        // Update
+        UpdatePlayer(deltaTime);
+        UpdateEnemies(deltaTime);
+        UpdateFireballs(deltaTime);
+
+        // Camera follows player smoothly
+        Vector3 camTarget = player.position;
+        camTarget.y += 1.0f;
+        camera.target = Vector3Lerp(camera.target, camTarget, 5 * deltaTime);
+        Vector3 camPos = player.position;
+        camPos.x += 10.0f;
+        camPos.y += 7.0f;
+        camPos.z += 10.0f;
+        camera.position = Vector3Lerp(camera.position, camPos, 5 * deltaTime);
+
+        // Draw
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        BeginMode3D(camera);
+        DrawModel(terrainModel, (Vector3){0, 0, 0}, 1.0f, GREEN);
+
+        // Draw player (cube for simplicity)
+        if (player.alive) {
+            DrawCube(player.position, 1.0f, 2.0f, 1.0f, BLUE);
+            DrawHealthBar((Vector3){player.position.x, player.position.y + 2.5f, player.position.z}, player.health, 100);
+        }
+
+        // Draw enemies
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            if (enemies[i].alive) {
+                DrawCube(enemies[i].position, 1.0f, 2.0f, 1.0f, RED);
+                DrawHealthBar((Vector3){enemies[i].position.x, enemies[i].position.y + 2.5f, enemies[i].position.z}, enemies[i].health, 50);
+            }
+        }
+
+        // Draw fireballs
+        for (int i = 0; i < MAX_FIREBALLS; i++) {
+            if (fireballs[i].active) {
+                DrawSphere(fireballs[i].position, 0.3f, ORANGE);
+            }
+        }
+
+        EndMode3D();
+
+        // HUD
+        DrawText("Controls: WASD Move, Space Jump, F Light Attack, G Heavy Attack, R Fireball, Left Shift Block", 10, 10, 14, DARKGRAY);
+
+        if (!player.alive) {
+            DrawText("You Died! Press R to Respawn.", 500, 350, 20, RED);
+        }
+
+        EndDrawing();
+    }
+
+    // Cleanup
+    UnloadModel(terrainModel);
+    UnloadSound(jumpSound);
+    UnloadSound(fireballSound);
+    UnloadSound(hitSound);
+    UnloadSound(blockSound);
+    CloseAudioDevice();
+    CloseWindow();
+
+    return 0;
+}
+
+void InitTerrain() {
+    Image heightmap = GenImageGradient(128, 128, GRAY, DARKGRAY);
+    terrainMesh = GenMeshHeightmap(heightmap, (Vector3){1.0f, 5.0f, 1.0f});
+    terrainModel = LoadModelFromMesh(terrainMesh);
+    UnloadImage(heightmap);
+}
+
+void DrawHealthBar(Vector3 position, int currentHealth, int maxHealth) {
+    // Convert 3D world pos to 2D screen pos
+    Vector2 pos2D = GetWorldToScreen(position, camera);
+    float barWidth = 60.0f;
+    float barHeight = 8.0f;
+    float healthRatio = (float)currentHealth / maxHealth;
+
+    DrawRectangle(pos2D.x - barWidth/2, pos2D.y, barWidth, barHeight, GRAY);
+    DrawRectangle(pos2D.x - barWidth/2, pos2D.y, barWidth * healthRatio, barHeight, GREEN);
+    DrawRectangleLines(pos2D.x - barWidth/2, pos2D.y, barWidth, barHeight, BLACK);
+}
+
+void UpdatePlayer(float dt) {
+    if (!player.alive) {
+        // Respawn
+        if (IsKeyPressed(KEY_R)) {
+            player.position = (Vector3){0, 1, 0};
+            player.health = 100;
+            player.alive = true;
+        }
+        return;
+    }
+
+    // Movement input
+    Vector3 moveDir = {0};
+    Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    forward.y = 0; // flatten movement on XZ plane
+    Vector3 right = Vector3Normalize(Vector3Cross(forward, camera.up));
+
+    if (IsKeyDown(KEY_W)) moveDir = Vector3Add(moveDir, forward);
+    if (IsKeyDown(KEY_S)) moveDir = Vector3Subtract(moveDir, forward);
+    if (IsKeyDown(KEY_D)) moveDir = Vector3Add(moveDir, right);
+    if (IsKeyDown(KEY_A)) moveDir = Vector3Subtract(moveDir, right);
+
+    if (Vector3Length(moveDir) > 0.0f) {
+        moveDir = Vector3Normalize(moveDir);
+        player.position = Vector3Add(player.position, Vector3Scale(moveDir, PLAYER_SPEED * dt));
+    }
+
+    // Gravity and jumping
+    player.velocity.y -= GRAVITY * dt;
+    player.position.y += player.velocity.y * dt;
+
+    // Simple ground collision at y=1.0
+    if (player.position.y <= 1.0f) {
+        player.position.y = 1.0f;
+        player.velocity.y = 0;
+        player.onGround = true;
+        canDoubleJump = true;
+        canWallJump = false;
+    } else {
+        player.onGround = false;
+    }
+
+    // Jumping
+    if (IsKeyPressed(KEY_SPACE)) {
+        if (player.onGround) {
+            player.velocity.y = PLAYER_JUMP_FORCE;
+            PlaySound(jumpSound);
+        } else if (canDoubleJump) {
+            player.velocity.y = PLAYER_JUMP_FORCE;
+            canDoubleJump = false;
+            PlaySound(jumpSound);
+        } else if (canWallJump) {
+            player.velocity.y = PLAYER_JUMP_FORCE;
+            canWallJump = false;
+            PlaySound(jumpSound);
+        }
+    }
+
+    // Attacks and blocking
+    if (IsKeyPressed(KEY_F)) PlayerAttackLight();
+    if (IsKeyPressed(KEY_G)) PlayerAttackHeavy();
+    if (IsKeyPressed(KEY_R)) SpawnFireball();
+
+    player.blocking = IsKeyDown(KEY_LEFT_SHIFT);
+    if (player.blocking) PlayerBlock();
+
+    // Clamp health to 0
+    if (player.health <= 0) {
+        player.health = 0;
+        player.alive = false;
+    }
+}
+
+void PlayerAttackLight() {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (!enemies[i].alive) continue;
+        float dist = Vector3Distance(player.position, enemies[i].position);
+        if (dist < 2.0f) {
+            enemies[i].health -= 10;
+            PlaySound(hitSound);
+            if (enemies[i].health <= 0) enemies[i].alive = false;
+        }
+    }
+}
+
+void PlayerAttackHeavy() {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (!enemies[i].alive) continue;
+        float dist = Vector3Distance(player.position, enemies[i].position);
+        if (dist < 3.0f) {
+            enemies[i].health -= 25;
+            PlaySound(hitSound);
+            if (enemies[i].health <= 0) enemies[i].alive = false;
+        }
+    }
+}
+
+void PlayerBlock() {
+    // Blocking reduces damage taken (handled in enemy attack logic)
+}
+
+void SpawnFireball() {
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        if (!fireballs[i].active) {
+            fireballs[i].active = true;
+            fireballs[i].position = (Vector3){player.position.x, player.position.y + 1.0f, player.position.z};
+            Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+            fireballs[i].velocity = Vector3Scale(forward, 10.0f);
+            PlaySound(fireballSound);
+            break;
+        }
+    }
+}
+
+void UpdateFireballs(float dt) {
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        if (!fireballs[i].active) continue;
+
+        fireballs[i].position = Vector3Add(fireballs[i].position, Vector3Scale(fireballs[i].velocity, dt));
+
+        // Check collision with enemies
+        for (int j = 0; j < MAX_ENEMIES; j++) {
+            if (!enemies[j].alive) continue;
+            if (Vector3Distance(fireballs[i].position, enemies[j].position) < 1.0f) {
+                enemies[j].health -= 20;
+                PlaySound(hitSound);
+                if (enemies[j].health <= 0) enemies[j].alive = false;
+                fireballs[i].active = false;
+                break;
+            }
+        }
+
+        // Deactivate fireball if too far from player
+        if (Vector3Distance(fireballs[i].position, player.position) > 50.0f) {
+            fireballs[i].active = false;
+        }
+    }
+}
+
+void UpdateEnemies(float dt) {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (!enemies[i].alive) continue;
+
+        Enemy &e = enemies[i];
+
+        // Simple patrol logic along X axis
+        if (e.movingToEnd) {
+            e.position.x += 2.0f * dt;
+            if (e.position.x >= e.patrolEnd.x) e.movingToEnd = false;
+        } else {
+            e.position.x -= 2.0f * dt;
+            if (e.position.x <= e.patrolStart.x) e.movingToEnd = true;
+        }
+
+        // Attack player if close
+        float dist = Vector3Distance(e.position, player.position);
+        if (dist < 2.0f && player.alive) {
+            if (!player.blocking) {
+                player.health -= 5;
+                PlaySound(hitSound);
+            } else {
+                PlaySound(blockSound);
+            }
+        }
+    }
+}
