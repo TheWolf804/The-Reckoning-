@@ -1,0 +1,620 @@
+#include "raylib.h"
+#include "raymath.h"
+#include <stdlib.h>
+#include <stdbool.h>
+
+#define MAX_ENEMIES 5
+#define MAX_FIREBALLS 10
+
+// --- Structs ---
+
+typedef struct Player {
+    Vector3 position;
+    Vector3 velocity;
+    int health;
+    bool onGround;
+    int jumpCount;
+    bool blocking;
+    bool attacking;
+    int xp;
+    int level;
+    // Perks points available to spend
+    int perkPoints;
+    // Perks chosen
+    int perks[5]; // One perk per fighting style category
+} Player;
+
+typedef struct Enemy {
+    Vector3 position;
+    int health;
+    bool active;
+    bool attacking;
+    bool staggered;
+    Vector3 patrolPoints[2];
+    int patrolTarget;
+} Enemy;
+
+typedef struct Fireball {
+    Vector3 position;
+    Vector3 velocity;
+    bool active;
+    int damage;
+} Fireball;
+
+typedef struct Perk {
+    const char* name;
+    const char* description;
+    int levelRequired;
+} Perk;
+
+typedef struct PerkCategory {
+    const char* name;
+    Perk perks[3];
+} PerkCategory;
+
+// --- Globals ---
+
+Player player;
+Enemy enemies[MAX_ENEMIES];
+Fireball fireballs[MAX_FIREBALLS];
+Camera3D camera;
+
+float deltaTime;
+bool isDead = false;
+bool showPerkMenu = false;
+
+Vector2 mousePos;
+
+// Perk categories and perks (3 perks each)
+PerkCategory perkCategories[5] = {
+    {"BRAWLER", {
+        {"Power Punch", "Light attacks deal +5 damage", 1},
+        {"Iron Fist", "Heavy attacks deal +10 damage", 3},
+        {"Berserker", "Take 20% less damage when blocking", 5},
+    }},
+    {"MAGE", {
+        {"Fireball Mastery", "Fireballs deal +10 damage", 1},
+        {"Mana Surge", "Faster fireball cooldown", 3},
+        {"Arcane Shield", "Fireball blocks stagger when hit", 5},
+    }},
+    {"KNIGHT", {
+        {"Shield Bash", "Blocking stuns enemies on contact", 1},
+        {"Fortress", "Health increased by 20", 3},
+        {"Vengeance", "Enemies take damage when blocking your attack", 5},
+    }},
+    {"WARRIOR", {
+        {"Dash Attack", "Enemies staggered when dashing", 1},
+        {"Battle Cry", "Temporarily boost damage after killing enemy", 3},
+        {"Unbreakable", "Resist stagger effects", 5},
+    }},
+    {"LEGEND", {
+        {"Legendary Strength", "Increase overall damage by 15%", 1},
+        {"Legendary Speed", "Increase movement speed by 20%", 3},
+        {"Legendary Vitality", "Increase max health by 50", 5},
+    }},
+};
+
+// UI constants for perks menu
+const int PERK_ICON_RADIUS = 25;
+const int PERKS_PER_CATEGORY = 3;
+
+// Selected category and perk index for perks menu
+int selectedCategory = 0;
+int selectedPerk = -1;
+
+// --- Function Prototypes ---
+
+void InitGame(void);
+void UpdatePlayer(float delta);
+void UpdateEnemies(float delta);
+void UpdateFireballs(float delta);
+void SpawnFireball(void);
+void DrawGame(void);
+void DrawHealthBar(Vector3 position, int health, int maxHealth);
+void ResetGame(void);
+
+void UpdatePerkMenu(void);
+void DrawPerkMenu(void);
+void ApplyPerkEffects(void);
+
+// --- Main ---
+
+int main(void)
+{
+    InitWindow(800, 600, "The Reckoning - 3D Raylib RPG with Perks");
+    InitAudioDevice();
+
+    InitGame();
+
+    SetTargetFPS(60);
+
+    while (!WindowShouldClose())
+    {
+        deltaTime = GetFrameTime();
+
+        mousePos = GetMousePosition();
+
+        // Toggle perk menu
+        if (IsKeyPressed(KEY_Z)) {
+            showPerkMenu = !showPerkMenu;
+        }
+
+        if (!isDead && !showPerkMenu) {
+            UpdatePlayer(deltaTime);
+            UpdateEnemies(deltaTime);
+            UpdateFireballs(deltaTime);
+        }
+        else if (showPerkMenu) {
+            UpdatePerkMenu();
+        }
+        else {
+            if (IsKeyPressed(KEY_SPACE)) {
+                ResetGame();
+            }
+        }
+
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        BeginMode3D(camera);
+        DrawGame();
+        EndMode3D();
+
+        if (isDead) {
+            DrawText("YOU DIED - Press SPACE to Restart", GetScreenWidth()/2 - 170, GetScreenHeight()/2, 30, RED);
+        }
+
+        if (showPerkMenu) {
+            DrawPerkMenu();
+        } else {
+            // Player health UI
+            DrawText(TextFormat("Health: %d  Level: %d  XP: %d  Perk Points: %d", player.health, player.level, player.xp, player.perkPoints), 10, 10, 20, RED);
+            DrawText("WASD to move, SPACE to jump, SHIFT to block", 10, 40, 15, DARKGRAY);
+            DrawText("Left Click: Light attack, Right Click: Heavy attack, R: Fireball", 10, 60, 15, DARKGRAY);
+            DrawText("Press Z to open Perks Menu", 10, 80, 15, DARKGRAY);
+        }
+
+        EndDrawing();
+    }
+
+    CloseAudioDevice();
+    CloseWindow();
+
+    return 0;
+}
+
+// --- Initialize game state ---
+
+void InitGame(void)
+{
+    player.position = (Vector3){ 0.0f, 1.0f, 0.0f };
+    player.velocity = (Vector3){ 0, 0, 0 };
+    player.health = 100;
+    player.onGround = true;
+    player.jumpCount = 0;
+    player.blocking = false;
+    player.attacking = false;
+    player.xp = 0;
+    player.level = 1;
+    player.perkPoints = 0;
+    for (int i = 0; i < 5; i++) player.perks[i] = -1;
+
+    isDead = false;
+    showPerkMenu = false;
+    selectedCategory = 0;
+    selectedPerk = -1;
+
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        enemies[i].position = (Vector3){ (float)(rand() % 20 - 10), 1.0f, (float)(rand() % 20 - 10) };
+        enemies[i].health = 50;
+        enemies[i].active = true;
+        enemies[i].attacking = false;
+        enemies[i].staggered = false;
+        enemies[i].patrolPoints[0] = enemies[i].position;
+        enemies[i].patrolPoints[1] = (Vector3){ enemies[i].position.x + 5.0f, 1.0f, enemies[i].position.z + 5.0f };
+        enemies[i].patrolTarget = 1;
+    }
+
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        fireballs[i].active = false;
+    }
+
+    camera.position = (Vector3){ 0.0f, 10.0f, 10.0f };
+    camera.target = player.position;
+    camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    ApplyPerkEffects();
+}
+
+// --- Update player logic ---
+
+void UpdatePlayer(float delta)
+{
+    Vector3 move = { 0, 0, 0 };
+
+    float moveSpeed = 5.0f;
+
+    // Increase speed if "Legendary Speed" perk chosen (Legend category, perk 1)
+    if (player.perks[4] == 1) moveSpeed *= 1.2f;
+
+    if (IsKeyDown(KEY_W)) move.z -= 1;
+    if (IsKeyDown(KEY_S)) move.z += 1;
+    if (IsKeyDown(KEY_A)) move.x -= 1;
+    if (IsKeyDown(KEY_D)) move.x += 1;
+
+    if (Vector3Length(move) > 0) {
+        move = Vector3Normalize(move);
+        player.position.x += move.x * moveSpeed * delta;
+        player.position.z += move.z * moveSpeed * delta;
+    }
+
+    // Gravity
+    player.velocity.y -= 20.0f * delta;
+    player.position.y += player.velocity.y * delta;
+
+    // Ground collision
+    if (player.position.y <= 1.0f) {
+        player.position.y = 1.0f;
+        player.onGround = true;
+        player.jumpCount = 0;
+        player.velocity.y = 0;
+    }
+
+    // Jumping (double jump allowed)
+    if (IsKeyPressed(KEY_SPACE)) {
+        if (player.onGround || player.jumpCount < 2) {
+            player.velocity.y = 8.0f;
+            player.onGround = false;
+            player.jumpCount++;
+        }
+    }
+
+    // Blocking mechanic
+    player.blocking = IsKeyDown(KEY_LEFT_SHIFT);
+
+    // Player attacks
+    player.attacking = false;
+
+    int lightDamage = 10;
+    int heavyDamage = 25;
+    int fireballDamage = 40;
+
+    // Apply BRAWLER perks
+    if (player.perks[0] == 0) lightDamage += 5;          // Power Punch
+    if (player.perks[0] == 1) heavyDamage += 10;         // Iron Fist
+    if (player.perks[0] == 2) {
+        // Berserker: 20% less damage when blocking, handled in enemy attack
+    }
+
+    // Apply MAGE perks
+    if (player.perks[1] == 0) fireballDamage += 10;      // Fireball Mastery
+
+    // Apply LEGEND perk for damage overall boost
+    if (player.perks[4] == 0) {
+        lightDamage = (int)(lightDamage * 1.15f);
+        heavyDamage = (int)(heavyDamage * 1.15f);
+        fireballDamage = (int)(fireballDamage * 1.15f);
+    }
+
+    // Light attack (left click)
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        player.attacking = true;
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            if (!enemies[i].active) continue;
+            float dist = Vector3Distance(player.position, enemies[i].position);
+            if (dist < 2.5f) {
+                enemies[i].health -= lightDamage;
+                enemies[i].staggered = true;
+            }
+        }
+    }
+
+    // Heavy attack (right click)
+    if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+        player.attacking = true;
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            if (!enemies[i].active) continue;
+            float dist = Vector3Distance(player.position, enemies[i].position);
+            if (dist < 3.5f) {
+                enemies[i].health -= heavyDamage;
+                enemies[i].staggered = true;
+            }
+        }
+    }
+
+    // Fireball attack (R)
+    if (IsKeyPressed(KEY_R)) {
+        SpawnFireball();
+    }
+
+    // Update camera to follow player smoothly
+    Vector3 camTarget = player.position;
+    Vector3 camPosition = { player.position.x, player.position.y + 10.0f, player.position.z + 10.0f };
+    camera.target = Vector3Lerp(camera.target, camTarget, 5.0f * delta);
+    camera.position = Vector3Lerp(camera.position, camPosition, 5.0f * delta);
+
+    // Clamp player health >= 0 and check death
+    if (player.health <= 0) {
+        player.health = 0;
+        isDead = true;
+    }
+}
+
+// --- Update enemies logic ---
+
+void UpdateEnemies(float delta)
+{
+    static float staggerTimers[MAX_ENEMIES] = {0};
+    static float dashCooldowns[MAX_ENEMIES] = {0};
+
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (!enemies[i].active) continue;
+
+        Enemy *e = &enemies[i];
+
+        if (e->health <= 0) {
+            e->active = false;
+
+            // Award XP for killing enemy
+            player.xp += 20;
+            // Level up check
+            if (player.xp >= player.level * 100) {
+                player.xp -= player.level * 100;
+                player.level++;
+                player.perkPoints++;
+                // Increase max health perk effect handled elsewhere
+                // Heal player on level up
+                player.health = 100 + (player.perks[4] == 2 ? 50 : 0);
+            }
+
+            continue;
+        }
+
+        // Patrol between two points
+        Vector3 target = e->patrolPoints[e->patrolTarget];
+        Vector3 dir = Vector3Subtract(target, e->position);
+        float dist = Vector3Length(dir);
+
+        if (dist < 0.1f) {
+            e->patrolTarget = (e->patrolTarget + 1) % 2;
+        } else {
+            dir = Vector3Normalize(dir);
+            e->position.x += dir.x * 2.0f * delta;
+            e->position.z += dir.z * 2.0f * delta;
+        }
+
+        // If player close enough, chase and attack
+        float distToPlayer = Vector3Distance(e->position, player.position);
+
+        if (distToPlayer < 6.0f && !e->staggered) {
+            // Dash attack cooldown timer
+            if (dashCooldowns[i] > 0) dashCooldowns[i] -= delta;
+
+            if (distToPlayer > 2.0f) {
+                // Dash toward player occasionally
+                if (dashCooldowns[i] <= 0) {
+                    Vector3 dashDir = Vector3Normalize(Vector3Subtract(player.position, e->position));
+                    e->position.x += dashDir.x * 8.0f * delta;
+                    e->position.z += dashDir.z * 8.0f * delta;
+                    dashCooldowns[i] = 3.0f;
+                }
+            } else {
+                // Attack player
+                if (!e->attacking) {
+                    e->attacking = true;
+                }
+            }
+        }
+
+        // Handle stagger timer
+        if (e->staggered) {
+            staggerTimers[i] += delta;
+            if (staggerTimers[i] > 1.0f) {
+                e->staggered = false;
+                staggerTimers[i] = 0;
+            }
+        }
+
+        // Damage player if attacking and close
+        if (e->attacking) {
+            if (distToPlayer < 2.0f) {
+                // Damage player, reduced if blocking with Berserker perk
+                int enemyDamage = 10;
+                if (player.blocking) {
+                    if (player.perks[0] == 2) { // Berserker perk
+                        enemyDamage = (int)(enemyDamage * 0.8f);
+                    } else {
+                        enemyDamage = (int)(enemyDamage * 0.5f);
+                    }
+                }
+                player.health -= enemyDamage;
+                e->attacking = false;
+            }
+            else {
+                e->attacking = false;
+            }
+        }
+    }
+}
+
+// --- Fireballs ---
+
+void SpawnFireball(void)
+{
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        if (!fireballs[i].active) {
+            fireballs[i].active = true;
+            fireballs[i].position = player.position;
+            Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+            fireballs[i].velocity = Vector3Scale(forward, 10.0f);
+            fireballs[i].damage = 40;
+
+            // Apply perks
+            if (player.perks[1] == 0) fireballs[i].damage += 10; // Fireball Mastery
+            if (player.perks[4] == 0) fireballs[i].damage = (int)(fireballs[i].damage * 1.15f);
+
+            break;
+        }
+    }
+}
+
+void UpdateFireballs(float delta)
+{
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        if (!fireballs[i].active) continue;
+
+        fireballs[i].position.x += fireballs[i].velocity.x * delta;
+        fireballs[i].position.y += fireballs[i].velocity.y * delta;
+        fireballs[i].position.z += fireballs[i].velocity.z * delta;
+
+        // Check collision with enemies
+        for (int j = 0; j < MAX_ENEMIES; j++) {
+            if (!enemies[j].active) continue;
+
+            float dist = Vector3Distance(fireballs[i].position, enemies[j].position);
+            if (dist < 1.5f) {
+                enemies[j].health -= fireballs[i].damage;
+                enemies[j].staggered = true;
+                fireballs[i].active = false;
+                break;
+            }
+        }
+
+        // Remove fireball if too far
+        if (Vector3Distance(fireballs[i].position, player.position) > 30.0f) {
+            fireballs[i].active = false;
+        }
+    }
+}
+
+// --- Draw the world and objects ---
+
+void DrawGame(void)
+{
+    // Draw ground
+    DrawPlane((Vector3){0,0,0}, (Vector2){50,50}, LIGHTGRAY);
+
+    // Draw player
+    DrawCube(player.position, 1.0f, 2.0f, 1.0f, BLUE);
+    DrawHealthBar(player.position, player.health, 100);
+
+    // Draw enemies
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (!enemies[i].active) continue;
+
+        Color c = RED;
+        if (enemies[i].staggered) c = ORANGE;
+        DrawCube(enemies[i].position, 1.0f, 2.0f, 1.0f, c);
+        DrawHealthBar(enemies[i].position, enemies[i].health, 50);
+    }
+
+    // Draw fireballs
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        if (!fireballs[i].active) continue;
+        DrawSphere(fireballs[i].position, 0.3f, PURPLE);
+    }
+}
+
+void DrawHealthBar(Vector3 position, int health, int maxHealth)
+{
+    Vector2 screenPos = GetWorldToScreen((Vector3){position.x, position.y + 2.3f, position.z}, camera);
+    DrawRectangle(screenPos.x - 25, screenPos.y, 50, 7, RED);
+    DrawRectangle(screenPos.x - 25, screenPos.y, (float)health / maxHealth * 50, 7, GREEN);
+}
+
+// --- Reset game ---
+
+void ResetGame(void)
+{
+    InitGame();
+}
+
+// --- Perks menu update ---
+
+void UpdatePerkMenu(void)
+{
+    // Navigate categories with arrow keys
+    if (IsKeyPressed(KEY_RIGHT)) {
+        selectedCategory = (selectedCategory + 1) % 5;
+        selectedPerk = -1;
+    }
+    if (IsKeyPressed(KEY_LEFT)) {
+        selectedCategory = (selectedCategory + 5 - 1) % 5;
+        selectedPerk = -1;
+    }
+
+    // Mouse input for perks selection
+    for (int i = 0; i < PERKS_PER_CATEGORY; i++) {
+        Vector2 center = {(float)(150 + i * 120), 200};
+        if (CheckCollisionPointCircle(mousePos, center, PERK_ICON_RADIUS)) {
+            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                selectedPerk = i;
+            }
+        }
+    }
+
+    // Buy/Apply perk
+    if (selectedPerk >= 0 && IsKeyPressed(KEY_ENTER)) {
+        if (player.perkPoints > 0) {
+            if (player.perks[selectedCategory] != selectedPerk) {
+                // Check level required for perk
+                Perk *p = &perkCategories[selectedCategory].perks[selectedPerk];
+                if (player.level >= p->levelRequired) {
+                    player.perks[selectedCategory] = selectedPerk;
+                    player.perkPoints--;
+                    ApplyPerkEffects();
+                }
+            }
+        }
+    }
+}
+
+// --- Draw perks menu ---
+
+void DrawPerkMenu(void)
+{
+    DrawRectangle(50, 50, GetScreenWidth() - 100, GetScreenHeight() - 100, Fade(DARKGRAY, 0.9f));
+
+    DrawText("PERKS MENU - Press Z to close", 60, 60, 20, YELLOW);
+
+    DrawText(TextFormat("Player Level: %d  Perk Points: %d", player.level, player.perkPoints), 60, 90, 18, WHITE);
+
+    // Draw categories
+    for (int i = 0; i < 5; i++) {
+        Color catColor = (i == selectedCategory) ? GOLD : LIGHTGRAY;
+        DrawText(perkCategories[i].name, 60 + i * 150, 130, 22, catColor);
+    }
+
+    // Draw perks for selected category
+    for (int i = 0; i < PERKS_PER_CATEGORY; i++) {
+        Vector2 center = {(float)(150 + i * 120), 200};
+        Color bgColor = LIGHTGRAY;
+        if (player.perks[selectedCategory] == i) bgColor = GREEN;
+        if (selectedPerk == i) bgColor = GOLD;
+
+        DrawCircleV(center, PERK_ICON_RADIUS, bgColor);
+        DrawText(perkCategories[selectedCategory].perks[i].name, center.x - 50, center.y + 30, 14, WHITE);
+
+        // Show level requirement
+        DrawText(TextFormat("Lvl %d", perkCategories[selectedCategory].perks[i].levelRequired), center.x - 20, center.y + 45, 12, RAYWHITE);
+
+        // Show description when selected
+        if (selectedPerk == i) {
+            DrawRectangle(150, 300, GetScreenWidth() - 300, 100, Fade(BLACK, 0.7f));
+            DrawText(perkCategories[selectedCategory].perks[i].description, 160, 310, 18, WHITE);
+            DrawText("Press ENTER to purchase/apply", 160, 340, 14, LIGHTGRAY);
+        }
+    }
+}
+
+// --- Apply perks effects to player stats (called on perk change) ---
+
+void ApplyPerkEffects(void)
+{
+    // Legendary Vitality perk - increase max health
+    if (player.perks[4] == 2) {
+        if (player.health < 150) player.health = 150;
+    }
+}
