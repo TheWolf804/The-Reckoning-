@@ -1,0 +1,129 @@
+#include "raylib.h"
+#include <string>
+#include <vector>
+#include <iostream>
+
+
+// ------------------ Perk System ------------------
+struct Perk {
+    std::string name;
+    std::string description;
+    bool unlocked;
+    int level;
+    int maxLevel;
+
+    Perk(std::string n, std::string d, int maxL) 
+        : name(n), description(d), unlocked(false), level(0), maxLevel(maxL) {}
+
+    void Upgrade() {
+        if (level < maxLevel) {
+            level++;
+            unlocked = true;
+        }
+    }
+};
+
+// ------------------ Player ------------------
+struct Player {
+    int health;
+    int maxHealth;
+    int attack;
+    int defense;
+    int perkPoints;
+
+    Player() : health(100), maxHealth(100), attack(10), defense(5), perkPoints(0) {}
+};
+
+// ------------------ Global Game Variables ------------------
+Player player;
+std::vector<Perk> perks;
+
+// ------------------ Initialize Perks ------------------
+void InitPerks() {
+    perks.push_back(Perk("Strong Punch", "Increase attack damage by 5 per level.", 3));
+    perks.push_back(Perk("Iron Skin", "Increase defense by 3 per level.", 3));
+    perks.push_back(Perk("Health Boost", "Increase max health by 20 per level.", 2));
+    perks.push_back(Perk("Quick Recovery", "Recover 2 HP per second.", 1));
+}
+
+// ------------------ Apply Perk Effects ------------------
+void ApplyPerks() {
+    // Reset base stats
+    player.attack = 10;
+    player.defense = 5;
+    player.maxHealth = 100;
+
+    for (auto &perk : perks) {
+        if (perk.unlocked) {
+            if (perk.name == "Strong Punch") player.attack += 5 * perk.level;
+            if (perk.name == "Iron Skin") player.defense += 3 * perk.level;
+            if (perk.name == "Health Boost") player.maxHealth += 20 * perk.level;
+        }
+    }
+
+    // Handle health regeneration separately
+    for (auto &perk : perks) {
+        if (perk.unlocked && perk.name == "Quick Recovery") {
+            player.health += 2 * perk.level / 60; // 2 HP per second at 60 FPS
+        }
+    }
+
+    // Clamp health to max
+    if (player.health > player.maxHealth) player.health = player.maxHealth;
+    if (player.health < 0) player.health = 0;
+}
+
+// ------------------ Draw UI ------------------
+void DrawUI() {
+    DrawText(("Health: " + std::to_string(player.health) + "/" + std::to_string(player.maxHealth)).c_str(), 10, 10, 20, RED);
+    DrawText(("Attack: " + std::to_string(player.attack)).c_str(), 10, 40, 20, ORANGE);
+    DrawText(("Defense: " + std::to_string(player.defense)).c_str(), 10, 70, 20, GREEN);
+    DrawText(("Perk Points: " + std::to_string(player.perkPoints)).c_str(), 10, 100, 20, BLUE);
+
+    int y = 140;
+    DrawText("Perks:", 10, y, 20, GOLD);
+    y += 30;
+    for (size_t i = 0; i < perks.size(); i++) {
+        std::string perkText = perks[i].name + " (Level " + std::to_string(perks[i].level) + "/" + std::to_string(perks[i].maxLevel) + ")";
+        if (perks[i].unlocked) perkText += " [Unlocked]";
+        DrawText(perkText.c_str(), 10, y, 20, perks[i].unlocked ? GREEN : LIGHTGRAY);
+        y += 30;
+    }
+}
+
+// ------------------ Handle Perk Input ------------------
+void HandlePerkInput() {
+    for (size_t i = 0; i < perks.size(); i++) {
+        if (IsKeyPressed(KEY_ONE + i)) { // 1,2,3,4 keys
+            if (player.perkPoints > 0 && perks[i].level < perks[i].maxLevel) {
+                perks[i].Upgrade();
+                player.perkPoints--;
+            }
+        }
+    }
+}
+
+// ------------------ Main ------------------
+int main() {
+    InitWindow(800, 600, "Raylib Game with Perk System");
+    SetTargetFPS(60);
+
+    InitPerks();
+
+    // Give some initial perk points for testing
+    player.perkPoints = 5;
+
+    while (!WindowShouldClose()) {
+        HandlePerkInput();
+        ApplyPerks();
+
+        BeginDrawing();
+        ClearBackground(BLACK);
+        DrawUI();
+        DrawText("Press 1-4 to upgrade perks!", 10, 500, 20, WHITE);
+        EndDrawing();
+    }
+
+    CloseWindow();
+    return 0;
+}
