@@ -1,0 +1,1367 @@
+#include "raylib.h"
+#include "raymath.h"
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdio.h>
+
+#define MAX_ENEMIES 5
+#define MAX_FIREBALLS 10
+#define MAX_ENEMY_PROJECTILES 10
+#define TIERS 5
+#define PERKS_PER_TIER 10
+#define PERKS_PER_CATEGORY (TIERS*PERKS_PER_TIER)
+#define PERK_ICON_RADIUS 25
+#define MAX_PLAYER_LEVEL 60  // Max level cap added
+
+// --- Structs ---
+typedef struct PlayerStats {
+    int lightDamage;
+    int heavyDamage;
+    int fireballDamage;
+    float moveSpeed;
+    int maxHealth;
+    float blockDamageReduction;
+} PlayerStats;
+
+typedef struct Player {
+    Vector3 position;
+    Vector3 velocity;
+    int health;
+    bool onGround;
+    int jumpCount;
+    bool blocking;
+    bool attacking;
+    int xp;
+    int level;
+    int perkPoints;
+    int perks[5]; // legacy single-selection per category (kept for compatibility)
+    PlayerStats stats;
+    // new: per-style XP/levels
+    int styleLevels[5];
+    int styleXP[5];
+    bool boughtPerks[5][PERKS_PER_CATEGORY];
+} Player;
+
+typedef struct Enemy {
+    Vector3 position;
+    int health;
+    int maxHealth;
+    bool active;
+    bool attacking;
+    bool staggered;
+    bool retaliating; // new: enemy may retaliate when hit
+    Vector3 patrolPoints[2];
+    int patrolTarget;
+    int damage;
+    float speed;
+    int level;
+} Enemy;
+
+typedef struct Fireball {
+    Vector3 position;
+    Vector3 velocity;
+    bool active;
+    int damage;
+} Fireball;
+
+typedef struct EnemyProjectile {
+    Vector3 position;
+    Vector3 velocity;
+    bool active;
+    int damage;
+    bool isMagic; // magic balls home towards player
+} EnemyProjectile;
+
+typedef struct Perk {
+    char* name;
+    char* description;
+    int levelRequired; // style level required (1,5,10,15,20)
+} Perk;
+
+typedef struct PerkCategory {
+    const char* name;
+    Perk perks[PERKS_PER_CATEGORY];
+} PerkCategory;
+
+// Region struct and region system (Regions Update integrated)
+typedef struct Region {
+    int id;
+    const char* name;
+    Vector2 center;      // x,z center
+    float radius;        // effective radius for region detection
+    Color ambientColor;  // ambient tint for environment
+    float enemyMultiplier; // difficulty multiplier for this region
+    bool unlocked;       // whether player has unlocked region (progression)
+    Vector3 spawnPoint;  // optional spawn point for fast travel
+} Region;
+
+// Difficulty now includes behaviour parameters
+typedef struct DifficultySettings {
+    const char* name;
+    float enemyHealthMultiplier;
+    float enemyDamageMultiplier;
+    float enemySpeedMultiplier;
+    float aggressiveness;   // how likely they are to chase/close gap
+    float skill;            // chance to parry/block/avoid (0..1)
+    float rangedChance;     // chance to use ranged attacks (0..1)
+    float retaliationChance; // chance to immediately retaliate when hit (0..1)
+} DifficultySettings;
+
+// --- Menu System ---
+typedef enum MenuScreen {
+    MENU_START,
+    MENU_SETTINGS,
+    MENU_AUDIO,
+    MENU_VIDEO,
+    MENU_DIFFICULTY,
+    MENU_GAME,
+    MENU_EXIT
+} MenuScreen;
+
+// --- Globals ---
+Player player;
+Enemy enemies[MAX_ENEMIES];
+Fireball fireballs[MAX_FIREBALLS];
+EnemyProjectile enemyProjectiles[MAX_ENEMY_PROJECTILES];
+Camera3D camera;
+
+// Regions data
+#define MAX_REGIONS 32
+Region regions[MAX_REGIONS];
+int regionCount = 0;
+int currentRegionIndex = 0;
+
+// Fast travel & minimap
+bool fastTravelMenu = false;
+int fastTravelSelection = 0;
+bool showMinimap = true;
+Vector2 minimapPos;
+int minimapSize = 160;
+
+// Global act/progression variable
+int gameAct = 0;
+
+// --- Forward declarations for environment drawing ---
+void DrawEnvironment(void);
+void DrawHouse(Vector3 pos, float scale);
+void DrawTree(Vector3 pos, float scale);
+
+// Regions helpers
+void InitRegions(void);
+void RandomizeRegionContent(int regionIndex);
+int FindRegionByPosition(Vector3 pos);
+void UpdateRegions(float delta);
+void UnlockAct1Regions(void);
+void FastTravelToRegion(int id);
+void UpdateFastTravel(void);
+void DrawFastTravelMenu(void);
+void DrawMinimap(void);
+
+// --- Other forward declarations ---
+float deltaTime;
+// Static environment placement for tutorial village (hand-placed)
+static Vector3 housePositions[4] = { {3.0f, 1.0f, 3.0f}, {-4.0f, 1.0f, 5.0f}, {6.0f, 1.0f, -2.0f}, {-6.0f, 1.0f, -4.0f} };
+static float houseScales[4] = {1.0f, 1.2f, 0.9f, 1.1f};
+static Vector3 treePositions[8] = { {2.0f,1.0f,8.0f}, {-2.0f,1.0f,9.0f}, {5.0f,1.0f,6.0f}, {-5.0f,1.0f,6.5f}, {8.0f,1.0f,-1.0f}, {-8.0f,1.0f,-2.0f}, {0.0f,1.0f,-6.0f}, {3.0f,1.0f,-7.5f} };
+static Vector3 fenceStart = {-8.0f, 0.5f, 10.0f};
+static int fencePosts = 10;
+
+bool isDead = false;
+bool showPerkMenu = false;
+Vector2 mousePos;
+int selectedCategory = 0;
+int selectedPerk = -1; // index within PERKS_PER_CATEGORY when viewing
+
+MenuScreen currentScreen = MENU_START;
+int mainMenuSelection = 0;
+int settingsMenuSelection = 0;
+
+// Audio/Video/Difficulty options
+float masterVolume = 1.0f;
+float musicVolume = 1.0f;
+float sfxVolume = 1.0f;
+bool fullscreen = false;
+int screenWidth = 800;
+int screenHeight = 600;
+int difficulty = 2; // 0: Practise ... 7: Armagedon
+
+DifficultySettings difficulties[8] = {
+    // name, healthMult, dmgMult, speedMult, aggressiveness, skill, rangedChance, retaliationChance
+    {"Practise", 0.5f, 0.5f, 0.5f, 0.4f, 0.10f, 0.10f, 0.05f},
+    {"Easy",     0.8f, 0.8f, 0.8f, 0.6f, 0.20f, 0.15f, 0.10f},
+    {"Normal",   1.0f, 1.0f, 1.0f, 1.0f, 0.40f, 0.35f, 0.25f},
+    {"Hard",     1.2f, 1.2f, 1.1f, 1.3f, 0.55f, 0.50f, 0.40f},
+    {"Insane",   1.5f, 1.5f, 1.2f, 1.6f, 0.70f, 0.65f, 0.60f},
+    {"Nightmare",2.0f, 2.0f, 1.5f, 2.0f, 0.80f, 0.75f, 0.75f},
+    {"DeathWish",3.0f, 3.0f, 2.0f, 3.0f, 0.90f, 0.85f, 0.85f},
+    {"Armagedon",5.0f, 5.0f, 3.0f, 4.0f, 0.98f, 0.95f, 0.95f}
+};
+
+PerkCategory perkCategories[5]; // will be filled at Init
+
+// --- Function Prototypes ---
+void InitGame(void);
+void SetupPerks(void);
+void UpdatePlayer(float delta);
+void UpdateEnemies(float delta);
+void UpdateFireballs(float delta);
+void SpawnFireball(void);
+void DrawGame(void);
+void DrawHealthBar(Vector3 position, int health, int maxHealth);
+void ResetGame(void);
+void UpdatePerkMenu(void);
+void DrawPerkMenu(void);
+void ApplyPerkEffects(void);
+void ScaleEnemyStats(Enemy* e);
+void LevelUpPlayer(void);
+void SpawnEnemy(Enemy* e, Vector3 pos);
+
+// Enemy projectiles
+void SpawnEnemyProjectile(Enemy* e, bool isMagic);
+void UpdateEnemyProjectiles(float delta);
+
+// --- Menu Functions ---
+void UpdateMainMenu(void);
+void DrawMainMenu(void);
+void UpdateSettingsMenu(void);
+void DrawSettingsMenu(void);
+void UpdateAudioMenu(void);
+void DrawAudioMenu(void);
+void UpdateVideoMenu(void);
+void DrawVideoMenu(void);
+void UpdateDifficultyMenu(void);
+void DrawDifficultyMenu(void);
+
+// --- Helpers ---
+void AddStyleXP(int styleIndex, int xpGain);
+
+// --- Main ---
+int main(void)
+{
+    InitWindow(screenWidth, screenHeight, "The Reckoning - 3D Raylib RPG with Menu");
+    InitAudioDevice();
+    InitGame();
+    SetTargetFPS(60);
+
+    while (!WindowShouldClose())
+    {
+        deltaTime = GetFrameTime();
+        mousePos = GetMousePosition();
+
+        switch(currentScreen) {
+            case MENU_START: UpdateMainMenu(); break;
+            case MENU_SETTINGS: UpdateSettingsMenu(); break;
+            case MENU_AUDIO: UpdateAudioMenu(); break;
+            case MENU_VIDEO: UpdateVideoMenu(); break;
+            case MENU_DIFFICULTY: UpdateDifficultyMenu(); break;
+            case MENU_GAME:
+                if (IsKeyPressed(KEY_Z)) showPerkMenu = !showPerkMenu;
+
+                // toggle fast travel menu with T if unlocked
+                if (IsKeyPressed(KEY_T) && gameAct >= 1) fastTravelMenu = !fastTravelMenu;
+
+                // toggle minimap with M
+                if (IsKeyPressed(KEY_M)) showMinimap = !showMinimap;
+
+                // Press L to unlock Act1 regions (development/testing)
+                if (IsKeyPressed(KEY_L)) {
+                    if (gameAct < 1) gameAct = 1;
+                    UnlockAct1Regions();
+                }
+
+                if (!isDead && !showPerkMenu && !fastTravelMenu) {
+                    UpdatePlayer(deltaTime);
+                    UpdateEnemies(deltaTime);
+                    UpdateFireballs(deltaTime);
+                    UpdateEnemyProjectiles(deltaTime);
+                    UpdateRegions(deltaTime);
+                }
+                else if (showPerkMenu) UpdatePerkMenu();
+                else if (fastTravelMenu) UpdateFastTravel();
+                else if (IsKeyPressed(KEY_SPACE)) ResetGame();
+                break;
+            case MENU_EXIT:
+                CloseAudioDevice();
+                CloseWindow();
+                return 0;
+        }
+
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        switch(currentScreen) {
+            case MENU_START: DrawMainMenu(); break;
+            case MENU_SETTINGS: DrawSettingsMenu(); break;
+            case MENU_AUDIO: DrawAudioMenu(); break;
+            case MENU_VIDEO: DrawVideoMenu(); break;
+            case MENU_DIFFICULTY: DrawDifficultyMenu(); break;
+            case MENU_GAME:
+                BeginMode3D(camera);
+                DrawGame();
+                EndMode3D();
+
+                if (isDead)
+                    DrawText("YOU DIED - Press SPACE to Restart", GetScreenWidth()/2 - 170, GetScreenHeight()/2, 30, RED);
+
+                if (showPerkMenu) DrawPerkMenu();
+                else {
+                    DrawText(TextFormat("Health: %d/%d  Level: %d  XP: %d  Perk Points: %d",
+                                player.health, player.stats.maxHealth, player.level, player.xp, player.perkPoints), 10, 10, 20, RED);
+                    DrawText("WASD to move, SPACE to jump, SHIFT to block", 10, 40, 15, DARKGRAY);
+                    DrawText("Left Click: Light attack, Right Click: Heavy attack, R: Fireball", 10, 60, 15, DARKGRAY);
+                    DrawText("Press Z to open Perks Menu", 10, 80, 15, DARKGRAY);
+                    DrawText("Press 1-5 to switch fighting styles", 10, 100, 15, DARKGRAY);
+                    DrawText("T: Fast Travel (Act1 unlocked)  M: Toggle Minimap", 10, 120, 12, DARKGRAY);
+                }
+
+                if (showMinimap) DrawMinimap();
+                if (fastTravelMenu) DrawFastTravelMenu();
+                break;
+            default: break;
+        }
+
+        EndDrawing();
+    }
+
+    CloseAudioDevice();
+    CloseWindow();
+    return 0;
+}
+
+// --- Initialize game ---
+void InitGame(void)
+{
+    player.position = (Vector3){ 0.0f, 1.0f, 0.0f };
+    player.velocity = (Vector3){ 0,0,0 };
+    player.health = 100;
+    player.onGround = true;
+    player.jumpCount = 0;
+    player.blocking = false;
+    player.attacking = false;
+    player.xp = 0;
+    player.level = 1;
+    player.perkPoints = 0;
+    for (int i=0;i<5;i++) player.perks[i]=-1;
+
+    // init new style xp/levels and bought perks
+    for (int s=0; s<5; s++) {
+        player.styleLevels[s] = 1; // start at level 1 for each style
+        player.styleXP[s] = 0;
+        for (int k=0;k<PERKS_PER_CATEGORY;k++) player.boughtPerks[s][k] = false;
+    }
+
+    isDead = false;
+    showPerkMenu = false;
+    selectedCategory = 0;
+    selectedPerk = -1;
+
+    SetupPerks(); // fill perkCategories dynamically
+
+    for (int i=0;i<MAX_ENEMIES;i++) {
+        SpawnEnemy(&enemies[i], (Vector3){ (float)(rand()%20-10), 1.0f, (float)(rand()%20-10) });
+    }
+
+    for (int i=0;i<MAX_FIREBALLS;i++) fireballs[i].active = false;
+    for (int i=0;i<MAX_ENEMY_PROJECTILES;i++) enemyProjectiles[i].active = false;
+
+    camera.position = (Vector3){ 0.0f, 10.0f, 10.0f };
+    camera.target = player.position;
+    camera.up = (Vector3){ 0,1,0 };
+    camera.fovy = 45.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    // initialize regions and minimap placement
+    InitRegions();
+
+    ApplyPerkEffects();
+}
+
+// Create perk names and descriptions programmatically for each category and tier
+void SetupPerks(void)
+{
+    const char* styleNames[5] = {"BRAWLER","MAGE","KNIGHT","WARRIOR","LEGEND"};
+    int tierReq[TIERS] = {1,5,10,15,20};
+
+    for (int s=0;s<5;s++) {
+        perkCategories[s].name = styleNames[s];
+        for (int t=0;t<TIERS;t++) {
+            for (int p=0;p<PERKS_PER_TIER;p++) {
+                int idx = t*PERKS_PER_TIER + p;
+                // allocate strings for name and description
+                char* nameBuf = (char*)malloc(64);
+                char* descBuf = (char*)malloc(128);
+                sprintf(nameBuf, "%s T%d-P%d", styleNames[s], t+1, p+1);
+                // give thematic descriptions per style
+                switch(s){
+                    case 0: // BRAWLER
+                        sprintf(descBuf, "Brawler Tier %d ability #%d: boosts melee power and stability.", t+1, p+1);
+                        break;
+                    case 1: // MAGE
+                        sprintf(descBuf, "Mage Tier %d ability #%d: enhances fire and arcane prowess.", t+1, p+1);
+                        break;
+                    case 2: // KNIGHT
+                        sprintf(descBuf, "Knight Tier %d ability #%d: improves defenses and guard tactics.", t+1, p+1);
+                        break;
+                    case 3: // WARRIOR
+                        sprintf(descBuf, "Warrior Tier %d ability #%d: increases mobility and stagger control.", t+1, p+1);
+                        break;
+                    default: // LEGEND
+                        sprintf(descBuf, "Legend Tier %d ability #%d: legendary bonuses to stats.", t+1, p+1);
+                        break;
+                }
+                perkCategories[s].perks[idx].name = nameBuf;
+                perkCategories[s].perks[idx].description = descBuf;
+                perkCategories[s].perks[idx].levelRequired = tierReq[t];
+            }
+        }
+    }
+}
+
+// --- Regions Implementation ---
+void InitRegions(void)
+{
+    regionCount = 0;
+
+    // Region 0: Tutorial Village (start)
+    regions[regionCount].id = 0;
+    regions[regionCount].name = "Tutorial Village";
+    regions[regionCount].center = (Vector2){0.0f, 6.0f};
+    regions[regionCount].radius = 30.0f;
+    regions[regionCount].ambientColor = Fade(SKYBLUE, 0.15f);
+    regions[regionCount].enemyMultiplier = 0.8f;
+    regions[regionCount].unlocked = true;
+    regions[regionCount].spawnPoint = (Vector3){0.0f,1.0f,0.0f};
+    regionCount++;
+
+    // Region 1: Forest (Act1)
+    regions[regionCount].id = 1;
+    regions[regionCount].name = "Whispering Forest";
+    regions[regionCount].center = (Vector2){ -40.0f, -20.0f };
+    regions[regionCount].radius = 45.0f;
+    regions[regionCount].ambientColor = Fade(GREEN, 0.18f);
+    regions[regionCount].enemyMultiplier = 1.0f;
+    regions[regionCount].unlocked = false; // locked until Act1
+    regions[regionCount].spawnPoint = (Vector3){-40.0f,1.0f,-20.0f};
+    regionCount++;
+
+    // Region 2: Ruins (Act1)
+    regions[regionCount].id = 2;
+    regions[regionCount].name = "Ancient Ruins";
+    regions[regionCount].center = (Vector2){ 50.0f, -10.0f };
+    regions[regionCount].radius = 40.0f;
+    regions[regionCount].ambientColor = Fade(LIGHTGRAY, 0.12f);
+    regions[regionCount].enemyMultiplier = 1.2f;
+    regions[regionCount].unlocked = false;
+    regions[regionCount].spawnPoint = (Vector3){50.0f,1.0f,-10.0f};
+    regionCount++;
+
+    // Region 3: Windy Halls (Act1)
+    regions[regionCount].id = 3;
+    regions[regionCount].name = "Windy Halls";
+    regions[regionCount].center = (Vector2){ 10.0f, 60.0f };
+    regions[regionCount].radius = 35.0f;
+    regions[regionCount].ambientColor = Fade(RAYWHITE, 0.10f);
+    regions[regionCount].enemyMultiplier = 1.15f;
+    regions[regionCount].unlocked = false;
+    regions[regionCount].spawnPoint = (Vector3){10.0f,1.0f,60.0f};
+    regionCount++;
+
+    // Region 4: Fields (open roam)
+    regions[regionCount].id = 4;
+    regions[regionCount].name = "Rolling Fields";
+    regions[regionCount].center = (Vector2){ 30.0f, 30.0f };
+    regions[regionCount].radius = 50.0f;
+    regions[regionCount].ambientColor = Fade(GOLD, 0.12f);
+    regions[regionCount].enemyMultiplier = 0.95f;
+    regions[regionCount].unlocked = true;
+    regions[regionCount].spawnPoint = (Vector3){30.0f,1.0f,30.0f};
+    regionCount++;
+
+    // Position minimap on top-right by default
+    minimapPos = (Vector2){ GetScreenWidth() - minimapSize - 20, 20 };
+}
+
+void RandomizeRegionContent(int regionIndex)
+{
+    if (regionIndex < 0 || regionIndex >= regionCount) return;
+    // Slight randomization of environment placement for that region
+    int seed = GetRandomValue(0,1000) + regionIndex*37;
+    // Jitter houses and trees around center
+    for (int i=0;i<4;i++){
+        float jitterX = (GetRandomValue(-10,10))/10.0f;
+        float jitterZ = (GetRandomValue(-10,10))/10.0f;
+        housePositions[i].x = regions[regionIndex].center.x + jitterX + (i*2 - 3);
+        housePositions[i].z = regions[regionIndex].center.y + jitterZ + (i%2==0?2:-2);
+        houseScales[i] = 0.8f + (GetRandomValue(80,120)/100.0f);
+    }
+    for (int t=0;t<8;t++){
+        float jitterX = (GetRandomValue(-15,15))/10.0f;
+        float jitterZ = (GetRandomValue(-15,15))/10.0f;
+        treePositions[t].x = regions[regionIndex].center.x + jitterX + (t - 4);
+        treePositions[t].z = regions[regionIndex].center.y + jitterZ - (t%3);
+    }
+    fenceStart.x = regions[regionIndex].center.x - 8.0f + GetRandomValue(-3,3);
+    fenceStart.z = regions[regionIndex].center.y + 10.0f + GetRandomValue(-2,2);
+
+    // Randomize enemy levels relative to region multiplier
+    for (int i=0;i<MAX_ENEMIES;i++){
+        if (!enemies[i].active) continue;
+        Vector3 pos;
+        pos.x = regions[regionIndex].center.x + (GetRandomValue(- (int)regions[regionIndex].radius, (int)regions[regionIndex].radius));
+        pos.z = regions[regionIndex].center.y + (GetRandomValue(- (int)regions[regionIndex].radius, (int)regions[regionIndex].radius));
+        enemies[i].position.x = pos.x;
+        enemies[i].position.z = pos.z;
+        enemies[i].maxHealth = (int)(enemies[i].maxHealth * regions[regionIndex].enemyMultiplier);
+        enemies[i].health = enemies[i].maxHealth;
+        enemies[i].damage = (int)(enemies[i].damage * regions[regionIndex].enemyMultiplier);
+        enemies[i].speed *= (1.0f + (regions[regionIndex].enemyMultiplier - 1.0f) * 0.15f);
+    }
+}
+
+int FindRegionByPosition(Vector3 pos)
+{
+    for (int i=0;i<regionCount;i++){
+        float d = Vector2Distance((Vector2){pos.x,pos.z}, (Vector2){regions[i].center.x, regions[i].center.y});
+        if (d <= regions[i].radius) return i;
+    }
+    return -1;
+}
+
+void UpdateRegions(float delta)
+{
+    // Determine which region the player is in
+    int idx = FindRegionByPosition(player.position);
+    if (idx != -1 && idx != currentRegionIndex) {
+        currentRegionIndex = idx;
+        // Randomize content when entering new region
+        RandomizeRegionContent(currentRegionIndex);
+        // Adjust ambient color or other world settings
+        Color ambient = regions[currentRegionIndex].ambientColor;
+        // Placeholder usage: you could pass ambient to shaders or draw a tint overlay
+    }
+
+    // Spawn region-specific enemies in unlocked regions only
+    for (int i=0;i<MAX_ENEMIES;i++){
+        if (!enemies[i].active) {
+            // spawn near player if in unlocked region
+            if (currentRegionIndex >=0 && regions[currentRegionIndex].unlocked) {
+                SpawnEnemy(&enemies[i], (Vector3){ regions[currentRegionIndex].center.x + GetRandomValue(-5,5), 1.0f, regions[currentRegionIndex].center.y + GetRandomValue(-5,5) });
+                enemies[i].maxHealth = (int)(enemies[i].maxHealth * regions[currentRegionIndex].enemyMultiplier);
+                enemies[i].health = enemies[i].maxHealth;
+                enemies[i].damage = (int)(enemies[i].damage * regions[currentRegionIndex].enemyMultiplier);
+            }
+        }
+    }
+}
+
+void UnlockAct1Regions(void)
+{
+    // Unlock the main Act1 regions
+    for (int i=0;i<regionCount;i++) {
+        if (regions[i].id == 1 || regions[i].id == 2 || regions[i].id == 3) {
+            regions[i].unlocked = true;
+        }
+    }
+}
+
+void FastTravelToRegion(int id)
+{
+    for (int i=0;i<regionCount;i++){
+        if (regions[i].id == id && regions[i].unlocked) {
+            player.position = regions[i].spawnPoint;
+            camera.target = player.position;
+            camera.position = (Vector3){ player.position.x, player.position.y + 10.0f, player.position.z + 10.0f };
+            fastTravelMenu = false;
+            return;
+        }
+    }
+}
+
+void UpdateFastTravel(void)
+{
+    if (!fastTravelMenu) return;
+    if (IsKeyPressed(KEY_UP)) {
+        fastTravelSelection = (fastTravelSelection - 1 + regionCount) % regionCount;
+    }
+    if (IsKeyPressed(KEY_DOWN)) {
+        fastTravelSelection = (fastTravelSelection + 1) % regionCount;
+    }
+    if (IsKeyPressed(KEY_ENTER)) {
+        if (regions[fastTravelSelection].unlocked) FastTravelToRegion(regions[fastTravelSelection].id);
+    }
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        fastTravelMenu = false;
+    }
+}
+
+void DrawFastTravelMenu(void)
+{
+    DrawRectangle(GetScreenWidth()/2 - 200, GetScreenHeight()/2 - 160, 400, 320, Fade(DARKGRAY, 0.9f));
+    DrawText("FAST TRAVEL", GetScreenWidth()/2 - 60, GetScreenHeight()/2 - 140, 24, YELLOW);
+    for (int i=0;i<regionCount;i++){
+        Color col = (i==fastTravelSelection) ? GOLD : LIGHTGRAY;
+        const char* lockTxt = regions[i].unlocked ? "" : " (Locked)";
+        DrawText(TextFormat("%2d: %s%s", regions[i].id, regions[i].name, lockTxt), GetScreenWidth()/2 - 160, GetScreenHeight()/2 - 100 + i*30, 16, col);
+    }
+    DrawText("UP/DOWN to navigate, ENTER to travel, ESC to close", GetScreenWidth()/2 - 180, GetScreenHeight()/2 + 120, 12, LIGHTGRAY);
+}
+
+void DrawMinimap(void)
+{
+    DrawRectangle(minimapPos.x-4, minimapPos.y-4, minimapSize+8, minimapSize+8, Fade(BLACK, 0.6f));
+    DrawRectangle(minimapPos.x, minimapPos.y, minimapSize, minimapSize, Fade(DARKGREEN, 0.6f));
+    // draw regions
+    for (int i=0;i<regionCount;i++){
+        float relX = (regions[i].center.x - player.position.x) * 0.5f + minimapPos.x + minimapSize/2;
+        float relY = (regions[i].center.y - player.position.z) * 0.5f + minimapPos.y + minimapSize/2;
+        Color rc = regions[i].unlocked ? GREEN : DARKGRAY;
+        DrawCircle(relX, relY, fmaxf(3.0f, regions[i].radius * 0.02f), rc);
+        Vector2 pos = { relX, relY };
+        DrawText(TextFormat("%d", regions[i].id), pos.x+6, pos.y-6, 10, WHITE);
+    }
+    // draw player dot in center
+    DrawCircle(minimapPos.x + minimapSize/2, minimapPos.y + minimapSize/2, 5, BLUE);
+}
+
+// --- Scale Enemy Stats Based on Difficulty & Player Level ---
+void ScaleEnemyStats(Enemy* e)
+{
+    DifficultySettings diff = difficulties[difficulty];
+
+    e->level = player.level + (rand() % 3 - 1); 
+    if (e->level < 1) e->level = 1;
+
+    e->maxHealth = (int)((50 + e->level * 10) * diff.enemyHealthMultiplier);
+    e->health = e->maxHealth;
+    e->damage = (int)((8 + e->level * 2) * diff.enemyDamageMultiplier);
+    e->speed = (2.0f + e->level * 0.05f) * diff.enemySpeedMultiplier;
+}
+
+// --- When Player Levels Up, Rescale All Active Enemies ---
+void LevelUpPlayer(void)
+{
+    player.level++;
+    player.perkPoints++;
+    player.health = player.stats.maxHealth;
+
+    for(int i=0;i<MAX_ENEMIES;i++)
+        if(enemies[i].active) ScaleEnemyStats(&enemies[i]);
+}
+
+// --- Spawn Enemy ---
+void SpawnEnemy(Enemy* e, Vector3 pos)
+{
+    e->position = pos;
+    e->active = true;
+    e->attacking = false;
+    e->staggered = false;
+    e->retaliating = false;
+    e->patrolPoints[0] = e->position;
+    e->patrolPoints[1] = (Vector3){ e->position.x + 5.0f, 1.0f, e->position.z + 5.0f };
+    e->patrolTarget = 1;
+
+    ScaleEnemyStats(e);
+}
+
+// --- Player ---
+void UpdatePlayer(float delta)
+{
+    Vector3 move = {0,0,0};
+    if (IsKeyDown(KEY_W)) move.z -= 1;
+    if (IsKeyDown(KEY_S)) move.z += 1;
+    if (IsKeyDown(KEY_A)) move.x -= 1;
+    if (IsKeyDown(KEY_D)) move.x += 1;
+
+    if (Vector3Length(move) > 0) {
+        move = Vector3Normalize(move);
+        player.position.x += move.x * player.stats.moveSpeed * delta;
+        player.position.z += move.z * player.stats.moveSpeed * delta;
+    }
+
+    player.velocity.y -= 20.0f * delta;
+    player.position.y += player.velocity.y * delta;
+
+    if (player.position.y <= 1.0f) {
+        player.position.y = 1.0f;
+        player.onGround = true;
+        player.jumpCount = 0;
+        player.velocity.y = 0;
+    }
+
+    if (IsKeyPressed(KEY_SPACE) && (player.onGround || player.jumpCount < 2)) {
+        player.velocity.y = 8.0f;
+        player.onGround = false;
+        player.jumpCount++;
+    }
+
+    player.blocking = IsKeyDown(KEY_LEFT_SHIFT);
+    player.attacking = false;
+
+    int lightDamage = player.stats.lightDamage;
+    int heavyDamage = player.stats.heavyDamage;
+
+    // get difficulty settings to allow enemies to parry/block/retaliate even before damage is applied
+    DifficultySettings diff = difficulties[difficulty];
+
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        player.attacking = true;
+        for (int i=0;i<MAX_ENEMIES;i++)
+            if (enemies[i].active && Vector3Distance(player.position, enemies[i].position) < 2.5f) {
+                // enemy may parry based on difficulty skill
+                int parryRoll = GetRandomValue(0,99);
+                if (parryRoll < (int)(diff.skill * 100.0f)) {
+                    // parry successful -> reduce damage and trigger retaliation chance
+                    enemies[i].health -= lightDamage/2;
+                    enemies[i].retaliating = (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f));
+                    enemies[i].staggered = false;
+                } else {
+                    enemies[i].health -= lightDamage;
+                    enemies[i].staggered = true;
+                    // award style XP for hitting
+                    AddStyleXP(selectedCategory, 5);
+                    // higher difficulties more likely to retaliate when hit
+                    if (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f)) enemies[i].retaliating = true;
+                }
+            }
+    }
+
+    if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+        player.attacking = true;
+        for (int i=0;i<MAX_ENEMIES;i++)
+            if (enemies[i].active && Vector3Distance(player.position, enemies[i].position) < 3.5f) {
+                int parryRoll = GetRandomValue(0,99);
+                if (parryRoll < (int)(diff.skill * 100.0f)) {
+                    enemies[i].health -= heavyDamage/2;
+                    enemies[i].retaliating = (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f));
+                    enemies[i].staggered = false;
+                } else {
+                    enemies[i].health -= heavyDamage;
+                    enemies[i].staggered = true;
+                    AddStyleXP(selectedCategory, 8);
+                    if (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f)) enemies[i].retaliating = true;
+                }
+            }
+    }
+
+    if (IsKeyPressed(KEY_R)) SpawnFireball();
+
+    Vector3 camTarget = player.position;
+    Vector3 camPos = { player.position.x, player.position.y + 10.0f, player.position.z + 10.0f };
+    camera.target = Vector3Lerp(camera.target, camTarget, 5.0f*delta);
+    camera.position = Vector3Lerp(camera.position, camPos, 5.0f*delta);
+
+    if (player.health <= 0) { player.health = 0; isDead = true; }
+}
+
+// Add XP to a style and handle level ups to max 20
+void AddStyleXP(int styleIndex, int xpGain)
+{
+    if (styleIndex < 0 || styleIndex >= 5) return;
+    if (player.styleLevels[styleIndex] >= 20) return;
+    player.styleXP[styleIndex] += xpGain;
+    int req = player.styleLevels[styleIndex] * 50; // arbitrary curve: 50 * current level
+    while (player.styleXP[styleIndex] >= req && player.styleLevels[styleIndex] < 20) {
+        player.styleXP[styleIndex] -= req;
+        player.styleLevels[styleIndex]++;
+        player.perkPoints++; // reward perk point on style level up
+        // increase player base XP slightly as reward
+        player.xp += 10;
+        req = player.styleLevels[styleIndex] * 50;
+    }
+}
+
+// --- Enemies ---
+void UpdateEnemies(float delta)
+{
+    static float staggerTimers[MAX_ENEMIES] = {0};
+    static float dashCooldowns[MAX_ENEMIES] = {0};
+    static float shootCooldowns[MAX_ENEMIES] = {0};
+
+    DifficultySettings diff = difficulties[difficulty];
+
+    for (int i=0;i<MAX_ENEMIES;i++) {
+        if (!enemies[i].active) continue;
+        Enemy *e = &enemies[i];
+
+        if (e->health <= 0) {
+            e->active = false;
+            player.xp += 20;
+
+            while (player.xp >= player.level*100 && player.level < MAX_PLAYER_LEVEL) {
+                player.xp -= player.level*100;
+                LevelUpPlayer();
+            }
+            if (player.level >= MAX_PLAYER_LEVEL) {
+                player.level = MAX_PLAYER_LEVEL;
+                player.xp = 0;
+            }
+
+            continue;
+        }
+
+        // Patrol movement when not engaged
+        Vector3 target = e->patrolPoints[e->patrolTarget];
+        Vector3 dir = Vector3Subtract(target, e->position);
+        float dist = Vector3Length(dir);
+        if (dist < 0.1f) e->patrolTarget = (e->patrolTarget + 1) % 2;
+        else {
+            dir = Vector3Normalize(dir);
+            e->position.x += dir.x * e->speed * delta * (1.0f / diff.aggressiveness); // less wandering at higher aggressiveness
+            e->position.z += dir.z * e->speed * delta * (1.0f / diff.aggressiveness);
+        }
+
+        float distToPlayer = Vector3Distance(e->position, player.position);
+
+        // Decrease cooldowns
+        if (dashCooldowns[i] > 0) dashCooldowns[i] -= delta;
+        if (shootCooldowns[i] > 0) shootCooldowns[i] -= delta;
+        if (staggerTimers[i] > 0) staggerTimers[i] -= delta;
+
+        // Stagger handling
+        if (e->staggered) {
+            // stagger duration slightly reduced by skill (higher skill means faster recovery)
+            if (staggerTimers[i] <= 0) staggerTimers[i] = 1.0f * (1.0f - diff.skill*0.5f);
+            if (staggerTimers[i] > 0) {
+                staggerTimers[i] -= delta;
+                if (staggerTimers[i] <= 0) { e->staggered=false; staggerTimers[i]=0; }
+            }
+        }
+
+        // If enemy is set to retaliate, try to immediately retaliate (melee or ranged depending on distance)
+        if (e->retaliating) {
+            if (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f)) {
+                // immediate burst: either dash+melee if close, or fire a projectile if not
+                if (distToPlayer <= 3.0f && dashCooldowns[i] <= 0) {
+                    Vector3 dashDir = Vector3Normalize(Vector3Subtract(player.position, e->position));
+                    e->position.x += dashDir.x * 8.0f * delta * diff.aggressiveness;
+                    e->position.z += dashDir.z * 8.0f * delta * diff.aggressiveness;
+                    // attempt immediate melee
+                    if (Vector3Distance(e->position, player.position) < 2.0f) {
+                        int damage = e->damage;
+                        if (player.blocking) damage = (int)(damage * player.stats.blockDamageReduction);
+                        player.health -= damage;
+                    }
+                    dashCooldowns[i] = 2.0f;
+                } else if (shootCooldowns[i] <= 0) {
+                    // fire a magic ball to retaliate (more likely magic on higher difficulties)
+                    SpawnEnemyProjectile(e, GetRandomValue(0,99) < (int)(diff.skill*100.0f));
+                    shootCooldowns[i] = 1.5f / diff.aggressiveness;
+                }
+            }
+            e->retaliating = false; // clear flag whether or not retaliation executed
+        }
+
+        // Engage player if within detection range (scaled by aggressiveness)
+        float detectRange = 6.0f * diff.aggressiveness;
+        if (distToPlayer < detectRange && !e->staggered) {
+            // Wander less and focus player
+            if (distToPlayer > 2.0f && dashCooldowns[i] <= 0) {
+                // chance to dash based on aggressiveness
+                int dashRoll = GetRandomValue(0,99);
+                if (dashRoll < (int)(diff.aggressiveness*60.0f)) {
+                    Vector3 dashDir = Vector3Normalize(Vector3Subtract(player.position, e->position));
+                    e->position.x += dashDir.x * 8.0f * delta * diff.aggressiveness;
+                    e->position.z += dashDir.z * 8.0f * delta * diff.aggressiveness;
+                    dashCooldowns[i] = 3.0f / diff.aggressiveness;
+                }
+            } else if (distToPlayer <= 2.0f && !e->attacking) {
+                // decide whether to attack or attempt a parry/block
+                int actionRoll = GetRandomValue(0,99);
+                if (actionRoll < (int)(diff.skill * 50.0f)) {
+                    // block/parry (functional effect): reduce incoming damage for a short duration
+                    e->staggered = false;
+                    // brief guard that makes them resistant to stagger
+                    staggerTimers[i] = 0.5f * (1.0f - diff.skill*0.5f);
+                } else {
+                    // normal attack
+                    e->attacking = true;
+                }
+            }
+
+            // Ranged decision
+            if (distToPlayer > 2.5f && shootCooldowns[i] <= 0) {
+                int rangedRoll = GetRandomValue(0,99);
+                if (rangedRoll < (int)(diff.rangedChance * 100.0f)) {
+                    bool useMagic = (GetRandomValue(0,99) < (20 + e->level * 5));
+                    // higher difficulties favor magic slightly
+                    if (GetRandomValue(0,99) < (int)(diff.skill*50.0f)) useMagic = true;
+                    SpawnEnemyProjectile(e, useMagic);
+                    shootCooldowns[i] = fmaxf(0.5f, 2.0f / diff.aggressiveness);
+                }
+            }
+        }
+
+        // Perform attack if flagged
+        if (e->attacking) {
+            if (distToPlayer < 2.0f) {
+                int damage = e->damage;
+                if (player.blocking) damage = (int)(damage * player.stats.blockDamageReduction);
+                player.health -= damage;
+                e->attacking = false;
+            } else e->attacking = false;
+        }
+    }
+}
+
+// --- Fireballs (Player) ---
+void SpawnFireball(void)
+{
+    for (int i=0;i<MAX_FIREBALLS;i++) {
+        if (!fireballs[i].active) {
+            fireballs[i].active = true;
+            fireballs[i].position = player.position;
+            Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+            fireballs[i].velocity = Vector3Scale(forward, 10.0f);
+            fireballs[i].damage = player.stats.fireballDamage;
+            break;
+        }
+    }
+}
+
+void UpdateFireballs(float delta)
+{
+    DifficultySettings diff = difficulties[difficulty];
+
+    for (int i=0;i<MAX_FIREBALLS;i++) {
+        if (!fireballs[i].active) continue;
+        fireballs[i].position.x += fireballs[i].velocity.x*delta;
+        fireballs[i].position.y += fireballs[i].velocity.y*delta;
+        fireballs[i].position.z += fireballs[i].velocity.z*delta;
+
+        for (int j=0;j<MAX_ENEMIES;j++)
+            if (enemies[j].active && Vector3Distance(fireballs[i].position,enemies[j].position)<1.5f) {
+                // enemy may parry projectiles too (less likely than melee)
+                int parryRoll = GetRandomValue(0,99);
+                if (parryRoll < (int)(diff.skill * 50.0f)) {
+                    // parried -> reduced damage and possible retaliation
+                    enemies[j].health -= fireballs[i].damage/2;
+                    enemies[j].retaliating = (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f));
+                    enemies[j].staggered = false;
+                } else {
+                    enemies[j].health -= fireballs[i].damage;
+                    enemies[j].staggered = true;
+                    if (GetRandomValue(0,99) < (int)(diff.retaliationChance*100.0f)) enemies[j].retaliating = true;
+                }
+                fireballs[i].active = false;
+                break;
+            }
+
+        if (Vector3Distance(fireballs[i].position, player.position) > 30.0f)
+            fireballs[i].active = false;
+    }
+}
+
+// --- Enemy Projectiles (Fireballs & Magic Balls) ---
+void SpawnEnemyProjectile(Enemy* e, bool isMagic)
+{
+    for (int i=0;i<MAX_ENEMY_PROJECTILES;i++) {
+        if (!enemyProjectiles[i].active) {
+            enemyProjectiles[i].active = true;
+            enemyProjectiles[i].position = e->position;
+            enemyProjectiles[i].damage = e->damage; // scale with enemy damage
+            enemyProjectiles[i].isMagic = isMagic;
+
+            Vector3 toPlayer = Vector3Subtract(player.position, e->position);
+            Vector3 dir = Vector3Normalize(toPlayer);
+            // magic balls are slightly slower but home; fireballs faster and straight
+            if (isMagic) enemyProjectiles[i].velocity = Vector3Scale(dir, 6.0f);
+            else enemyProjectiles[i].velocity = Vector3Scale(dir, 12.0f);
+            break;
+        }
+    }
+}
+
+void UpdateEnemyProjectiles(float delta)
+{
+    for (int i=0;i<MAX_ENEMY_PROJECTILES;i++) {
+        if (!enemyProjectiles[i].active) continue;
+
+        if (enemyProjectiles[i].isMagic) {
+            // simple homing behaviour: adjust velocity slightly towards player each frame
+            Vector3 desired = Vector3Normalize(Vector3Subtract(player.position, enemyProjectiles[i].position));
+            enemyProjectiles[i].velocity = Vector3Normalize(Vector3Add(Vector3Scale(enemyProjectiles[i].velocity, 0.9f), Vector3Scale(desired, 0.1f)));
+            enemyProjectiles[i].velocity = Vector3Scale(enemyProjectiles[i].velocity, 6.0f);
+        }
+
+        enemyProjectiles[i].position.x += enemyProjectiles[i].velocity.x * delta;
+        enemyProjectiles[i].position.y += enemyProjectiles[i].velocity.y * delta;
+        enemyProjectiles[i].position.z += enemyProjectiles[i].velocity.z * delta;
+
+        // Collision with player
+        if (Vector3Distance(enemyProjectiles[i].position, player.position) < 1.2f) {
+            int damage = enemyProjectiles[i].damage;
+            if (player.blocking) damage = (int)(damage * player.stats.blockDamageReduction);
+            player.health -= damage;
+            enemyProjectiles[i].active = false;
+            continue;
+        }
+
+        // Optional: player fireballs can collide with enemy projectiles and destroy them (deflect)
+        for (int j=0;j<MAX_FIREBALLS;j++) {
+            if (!fireballs[j].active) continue;
+            if (Vector3Distance(enemyProjectiles[i].position, fireballs[j].position) < 0.8f) {
+                // both destroyed
+                enemyProjectiles[i].active = false;
+                fireballs[j].active = false;
+                break;
+            }
+        }
+
+        // despawn if too far
+        if (Vector3Distance(enemyProjectiles[i].position, player.position) > 50.0f ||
+            Vector3Distance(enemyProjectiles[i].position, (Vector3){0,0,0}) > 100.0f) {
+            enemyProjectiles[i].active = false;
+        }
+    }
+}
+
+// --- Drawing ---
+void DrawGame(void)
+{
+    // Environment drawn via DrawEnvironment()
+    DrawEnvironment();
+    DrawCube(player.position,1.0f,2.0f,1.0f,BLUE);
+    DrawHealthBar(player.position,player.health,player.stats.maxHealth);
+
+    for (int i=0;i<MAX_ENEMIES;i++)
+        if (enemies[i].active) {
+            Color c = enemies[i].staggered? ORANGE : RED;
+            DrawCube(enemies[i].position,1.0f,2.0f,1.0f,c);
+            DrawHealthBar(enemies[i].position,enemies[i].health,enemies[i].maxHealth);
+        }
+
+    for (int i=0;i<MAX_FIREBALLS;i++)
+        if (fireballs[i].active)
+            DrawSphere(fireballs[i].position,0.3f,PURPLE);
+
+    // draw enemy projectiles differently based on type
+    for (int i=0;i<MAX_ENEMY_PROJECTILES;i++) {
+        if (!enemyProjectiles[i].active) continue;
+        if (enemyProjectiles[i].isMagic) DrawSphere(enemyProjectiles[i].position,0.35f,ORANGE);
+        else DrawSphere(enemyProjectiles[i].position,0.25f,MAROON);
+    }
+}
+
+// --- Environment drawing helpers ---
+
+void DrawHouse(Vector3 pos, float scale)
+{
+    // Walls
+    Vector3 wallSize = {2.0f * scale, 1.5f * scale, 2.0f * scale};
+    DrawCube(pos, wallSize.x, wallSize.y, wallSize.z, BEIGE);
+    // Slightly raised roof slab to read as a roof
+    Vector3 roofPos = { pos.x, pos.y + wallSize.y*0.75f, pos.z };
+    // Roof bigger in X and Z to look like an overhang
+    DrawCube(roofPos, wallSize.x * 1.2f, 0.4f * scale, wallSize.z * 1.2f, MAROON);
+    // Door
+    Vector3 doorPos = { pos.x + (wallSize.x*0.5f - 0.2f), pos.y - (wallSize.y*0.25f), pos.z };
+    DrawCube(doorPos, 0.4f*scale, 0.8f*scale, 0.05f*scale, BROWN);
+    // Window
+    Vector3 winPos = { pos.x - (wallSize.x*0.4f), pos.y, pos.z + (wallSize.z*0.45f) };
+    DrawCube(winPos, 0.4f*scale, 0.4f*scale, 0.05f*scale, SKYBLUE);
+}
+
+void DrawTree(Vector3 pos, float scale)
+{
+    // trunk
+    Vector3 trunkPos = { pos.x, pos.y - 0.5f * scale, pos.z };
+    DrawCube(trunkPos, 0.3f * scale, 1.0f * scale, 0.3f * scale, BROWN);
+    // foliage (three stacked spheres)
+    Vector3 leafPos1 = { pos.x, pos.y + 0.2f * scale, pos.z };
+    Vector3 leafPos2 = { pos.x + 0.15f * scale, pos.y + 0.5f * scale, pos.z - 0.1f * scale };
+    Vector3 leafPos3 = { pos.x - 0.15f * scale, pos.y + 0.6f * scale, pos.z + 0.1f * scale };
+    DrawSphere(leafPos1, 0.6f * scale, GREEN);
+    DrawSphere(leafPos2, 0.5f * scale, GREEN);
+    DrawSphere(leafPos3, 0.45f * scale, GREEN);
+}
+
+void DrawEnvironment(void)
+{
+    // Large grass plane for tutorial/prologue area
+    DrawPlane((Vector3){0,0,0}, (Vector2){200,200}, DARKGREEN);
+
+    // Draw a simple path (lighter plane strip)
+    for (int i=0;i<40;i++) {
+        DrawCube((Vector3){0.0f, 0.01f, -i*1.0f + 10.0f}, 4.0f, 0.02f, 1.0f, Fade(LIGHTGRAY, 0.6f));
+    }
+
+    // Draw houses in hand-placed positions
+    for (int i=0;i<4;i++) {
+        Vector3 hpos = housePositions[i];
+        DrawHouse(hpos, houseScales[i]);
+    }
+
+    // Draw trees
+    for (int i=0;i<8;i++) {
+        DrawTree(treePositions[i], 1.0f);
+    }
+
+    // Draw a simple fence along an edge of the village
+    for (int i=0;i<fencePosts;i++) {
+        Vector3 postPos = { fenceStart.x + i*1.6f, fenceStart.y, fenceStart.z };
+        DrawCube(postPos, 0.1f, 0.8f, 0.1f, BROWN);
+        // horizontal rail
+        Vector3 railPos = { postPos.x + 0.3f, postPos.y + 0.25f, postPos.z };
+        DrawCube(railPos, 1.4f, 0.08f, 0.08f, BROWN);
+    }
+
+    // region-based ambient overlay
+    Color ambient = regions[currentRegionIndex].ambientColor;
+    DrawCube((Vector3){player.position.x, -0.1f, player.position.z}, 200.0f, 0.02f, 200.0f, ambient);
+
+    // Simple signage near spawn
+    {
+        Vector2 signPos = GetWorldToScreen((Vector3){-2.5f,1.8f,6.0f}, camera);
+        DrawText("TUTORIAL VILLAGE", (int)signPos.x - 80, (int)signPos.y - 10, 20, YELLOW);
+    }
+}
+
+void DrawHealthBar(Vector3 position,int health,int maxHealth)
+{
+    Vector2 screenPos = GetWorldToScreen((Vector3){position.x,position.y+2.3f,position.z},camera);
+    DrawRectangle(screenPos.x-25,screenPos.y,50,7,RED);
+    DrawRectangle(screenPos.x-25,screenPos.y,(float)health/maxHealth*50,7,GREEN);
+}
+
+void ResetGame(void){ InitGame(); }
+
+// --- Perks ---
+void UpdatePerkMenu(void)
+{
+    if (IsKeyPressed(KEY_RIGHT)) { selectedCategory=(selectedCategory+1)%5; selectedPerk=-1; }
+    if (IsKeyPressed(KEY_LEFT)) { selectedCategory=(selectedCategory+4)%5; selectedPerk=-1; }
+
+    if (IsKeyPressed(KEY_ONE)) selectedCategory=0;
+    if (IsKeyPressed(KEY_TWO)) selectedCategory=1;
+    if (IsKeyPressed(KEY_THREE)) selectedCategory=2;
+    if (IsKeyPressed(KEY_FOUR)) selectedCategory=3;
+    if (IsKeyPressed(KEY_FIVE)) selectedCategory=4;
+
+    // grid layout: TIERS rows, PERKS_PER_TIER columns
+    int startX = 120;
+    int startY = 180;
+    int gapX = 90;
+    int gapY = 110;
+
+    for (int t=0;t<TIERS;t++){
+        for (int p=0;p<PERKS_PER_TIER;p++){
+            int idx = t*PERKS_PER_TIER + p;
+            Vector2 center = {(float)(startX + p*gapX), (float)(startY + t*gapY)};
+            if (CheckCollisionPointCircle(mousePos, center, PERK_ICON_RADIUS)) {
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) selectedPerk = idx;
+            }
+        }
+    }
+
+    if (selectedPerk>=0 && IsKeyPressed(KEY_ENTER) && player.perkPoints>0) {
+        Perk *pr = &perkCategories[selectedCategory].perks[selectedPerk];
+        int req = pr->levelRequired;
+        if (player.styleLevels[selectedCategory] >= req && !player.boughtPerks[selectedCategory][selectedPerk]) {
+            player.boughtPerks[selectedCategory][selectedPerk] = true;
+            player.perkPoints--;
+            ApplyPerkEffects();
+        }
+    }
+}
+
+void DrawPerkMenu(void)
+{
+    DrawRectangle(50,50,GetScreenWidth()-100,GetScreenHeight()-100,Fade(DARKGRAY,0.9f));
+    DrawText("PERKS MENU - Press Z to close",60,60,20,YELLOW);
+    DrawText(TextFormat("Player Level: %d  Perk Points: %d",player.level,player.perkPoints),60,90,18,WHITE);
+
+    for (int i=0;i<player.perkPoints;i++) DrawCircle(100+i*20,150,6,YELLOW);
+    DrawText("Perk Points",60,140,12,WHITE);
+
+    for (int i=0;i<5;i++) {
+        Color catColor = (i==selectedCategory)? GOLD : LIGHTGRAY;
+        DrawText(perkCategories[i].name,60+i*150,130,22,catColor);
+    }
+
+    int startX = 120;
+    int startY = 180;
+    int gapX = 90;
+    int gapY = 110;
+
+    for (int t=0;t<TIERS;t++){
+        // tier label
+        DrawText(TextFormat("Tier %d (Req Lvl %d)", t+1, perkCategories[selectedCategory].perks[t*PERKS_PER_TIER].levelRequired), 60, startY + t*gapY - 10, 14, LIGHTGRAY);
+        for (int p=0;p<PERKS_PER_TIER;p++){
+            int idx = t*PERKS_PER_TIER + p;
+            Vector2 center = {(float)(startX + p*gapX), (float)(startY + t*gapY)};
+            Color bg = LIGHTGRAY;
+            if (player.boughtPerks[selectedCategory][idx]) bg = GREEN;
+            if (selectedPerk == idx) bg = GOLD;
+
+            // locked if style level < required
+            if (player.styleLevels[selectedCategory] < perkCategories[selectedCategory].perks[idx].levelRequired) bg = DARKGRAY;
+
+            DrawCircleV(center, PERK_ICON_RADIUS, bg);
+            DrawText(perkCategories[selectedCategory].perks[idx].name, center.x-40, center.y+30, 12, WHITE);
+
+            if (selectedPerk==idx) {
+                DrawRectangle(150,500,GetScreenWidth()-300,80,Fade(BLACK,0.7f));
+                DrawText(perkCategories[selectedCategory].perks[idx].description,160,510,16,WHITE);
+                DrawText(TextFormat("Required Style Level: %d", perkCategories[selectedCategory].perks[idx].levelRequired),160,535,12,LIGHTGRAY);
+                if (player.boughtPerks[selectedCategory][idx]) DrawText("Purchased", GetScreenWidth()-260, 520, 14, GREEN);
+                else if (player.styleLevels[selectedCategory] < perkCategories[selectedCategory].perks[idx].levelRequired)
+                    DrawText("Locked - increase style level", GetScreenWidth()-360, 520, 14, RED);
+                else DrawText("Press ENTER to purchase", GetScreenWidth()-260, 520, 14, YELLOW);
+            }
+        }
+    }
+
+    // show style level and xp
+    DrawText(TextFormat("%s Level: %d  XP: %d/%d", perkCategories[selectedCategory].name, player.styleLevels[selectedCategory], player.styleXP[selectedCategory], player.styleLevels[selectedCategory]*50), 60, GetScreenHeight()-80, 16, WHITE);
+}
+
+// Apply all bought perks' effects. Effects are patterned so each perk has a meaningful impact.
+void ApplyPerkEffects(void)
+{
+    // reset base stats first
+    player.stats.lightDamage=10;
+    player.stats.heavyDamage=25;
+    player.stats.fireballDamage=40;
+    player.stats.moveSpeed=5.0f;
+    player.stats.maxHealth=100;
+    player.stats.blockDamageReduction=0.5f;
+
+    // preserve compatibility with legacy single-per-category selections
+    switch(player.perks[0]){
+        case 0: player.stats.lightDamage+=5; break;
+        case 1: player.stats.heavyDamage+=10; break;
+        case 2: player.stats.blockDamageReduction=0.8f; break;
+    }
+    if(player.perks[1]==0) player.stats.fireballDamage+=10;
+    if(player.perks[2]==1) player.stats.maxHealth+=20;
+
+    switch(player.perks[4]){
+        case 0:
+            player.stats.lightDamage=(int)(player.stats.lightDamage*1.15f);
+            player.stats.heavyDamage=(int)(player.stats.heavyDamage*1.15f);
+            player.stats.fireballDamage=(int)(player.stats.fireballDamage*1.15f);
+            break;
+        case 1: player.stats.moveSpeed*=1.2f; break;
+        case 2: player.stats.maxHealth+=50; break;
+    }
+
+    // Now apply effects from all bought perks across categories
+    for (int s=0;s<5;s++){
+        for (int k=0;k<PERKS_PER_CATEGORY;k++){
+            if (!player.boughtPerks[s][k]) continue;
+            int tier = (k / PERKS_PER_TIER) + 1; // 1..5
+            int posInTier = (k % PERKS_PER_TIER) + 1; // 1..10
+            // create meaningful patterned effects depending on style
+            switch(s){
+                case 0: // BRAWLER - melee focused
+                    player.stats.lightDamage += (int)(tier * (1 + posInTier/10.0f));
+                    player.stats.heavyDamage += (int)(tier * (2 + posInTier/8.0f));
+                    if (tier>=4 && posInTier%3==0) player.stats.blockDamageReduction *= 0.95f; // small improvement
+                    break;
+                case 1: // MAGE - fire/magic
+                    player.stats.fireballDamage += (int)(tier * (3 + posInTier/5.0f));
+                    if (tier>=3 && posInTier%2==0) player.stats.moveSpeed += 0.05f; // mage mobility tweaks
+                    break;
+                case 2: // KNIGHT - tanky
+                    player.stats.maxHealth += tier * (5 + posInTier);
+                    if (tier>=2 && posInTier%4==0) player.stats.blockDamageReduction *= 0.9f;
+                    break;
+                case 3: // WARRIOR - mobility & stagger
+                    player.stats.moveSpeed += 0.05f * tier;
+                    player.stats.heavyDamage += tier * 2;
+                    break;
+                case 4: // LEGEND - multiplies overall
+                    player.stats.lightDamage = (int)(player.stats.lightDamage * (1.0f + tier*0.02f));
+                    player.stats.heavyDamage = (int)(player.stats.heavyDamage * (1.0f + tier*0.02f));
+                    player.stats.fireballDamage = (int)(player.stats.fireballDamage * (1.0f + tier*0.02f));
+                    break;
+            }
+        }
+    }
+
+    if(player.health>player.stats.maxHealth) player.health=player.stats.maxHealth;
+}
+
+// --- Menus ---
+void UpdateMainMenu(void)
+{
+    if (IsKeyPressed(KEY_DOWN)) mainMenuSelection = (mainMenuSelection + 1) % 3;
+    if (IsKeyPressed(KEY_UP)) mainMenuSelection = (mainMenuSelection + 2) % 3;
+
+    if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        switch(mainMenuSelection) {
+            case 0: currentScreen = MENU_GAME; break;
+            case 1: currentScreen = MENU_SETTINGS; settingsMenuSelection=0; break;
+            case 2: currentScreen = MENU_EXIT; break;
+        }
+    }
+}
+
+void DrawMainMenu(void)
+{
+    DrawText("THE RECKONING", screenWidth/2 - 150, 100, 50, GOLD);
+
+    const char* options[3] = {"Start Game","Settings","Exit"};
+    for (int i=0;i<3;i++) {
+        Color col = (i==mainMenuSelection)? GOLD : LIGHTGRAY;
+        DrawText(options[i], screenWidth/2 - 80, 250 + i*60, 30, col);
+    }
+}
+
+void UpdateSettingsMenu(void)
+{
+    if (IsKeyPressed(KEY_DOWN)) settingsMenuSelection = (settingsMenuSelection + 1) % 4;
+    if (IsKeyPressed(KEY_UP)) settingsMenuSelection = (settingsMenuSelection + 3) % 4;
+
+    if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        switch(settingsMenuSelection) {
+            case 0: currentScreen = MENU_AUDIO; break;
+            case 1: currentScreen = MENU_VIDEO; break;
+            case 2: currentScreen = MENU_DIFFICULTY; break;
+            case 3: currentScreen = MENU_START; break;
+        }
+    }
+    if (IsKeyPressed(KEY_ESCAPE)) currentScreen = MENU_START;
+}
+
+void DrawSettingsMenu(void)
+{
+    DrawText("SETTINGS", screenWidth/2 - 80, 100, 50, GOLD);
+    const char* options[4] = {"Audio","Video","Difficulty","Back"};
+    for (int i=0;i<4;i++) {
+        Color col = (i==settingsMenuSelection)? GOLD : LIGHTGRAY;
+        DrawText(options[i], screenWidth/2 - 80, 250 + i*60, 30, col);
+    }
+}
+
+void UpdateAudioMenu(void) { if (IsKeyPressed(KEY_ESCAPE)) currentScreen = MENU_SETTINGS; }
+void DrawAudioMenu(void)
+{
+    DrawText("AUDIO SETTINGS - Press ESC to go back", 50,50,20,YELLOW);
+    DrawText(TextFormat("Master Volume: %.1f",masterVolume), 100,150,20,WHITE);
+    DrawText(TextFormat("Music Volume: %.1f",musicVolume), 100,200,20,WHITE);
+    DrawText(TextFormat("SFX Volume: %.1f",sfxVolume), 100,250,20,WHITE);
+}
+
+void UpdateVideoMenu(void) { if (IsKeyPressed(KEY_ESCAPE)) currentScreen = MENU_SETTINGS; }
+void DrawVideoMenu(void)
+{
+    DrawText("VIDEO SETTINGS - Press ESC to go back",50,50,20,YELLOW);
+    DrawText(TextFormat("Resolution: %dx%d",screenWidth,screenHeight), 100,150,20,WHITE);
+    DrawText(TextFormat("Fullscreen: %s", fullscreen?"ON":"OFF"), 100,200,20,WHITE);
+}
+
+void UpdateDifficultyMenu(void)
+{
+    if (IsKeyPressed(KEY_ESCAPE)) currentScreen = MENU_SETTINGS;
+    if (IsKeyPressed(KEY_DOWN)) difficulty = (difficulty + 1) % 8;
+    if (IsKeyPressed(KEY_UP)) difficulty = (difficulty + 7) % 8;
+}
+void DrawDifficultyMenu(void)
+{
+    DrawText("DIFFICULTY SETTINGS - Press ESC to go back",50,50,20,YELLOW);
+    for(int i=0;i<8;i++){
+        Color col = (i==difficulty)? GOLD : LIGHTGRAY;
+        DrawText(difficulties[i].name,100,150+i*50,20,col);
+    }
+}
